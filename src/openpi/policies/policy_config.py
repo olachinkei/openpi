@@ -13,6 +13,57 @@ from openpi.training import config as _config
 import openpi.transforms as transforms
 
 
+def create_policy_from_model(
+    train_config: _config.TrainConfig,
+    model: _model.BaseModel,
+    *,
+    repack_transforms: transforms.Group | None = None,
+    sample_kwargs: dict[str, Any] | None = None,
+    default_prompt: str | None = None,
+    norm_stats: dict[str, transforms.NormStats] | None = None,
+    pytorch_device: str | None = None,
+    is_pytorch: bool = False,
+) -> _policy.Policy:
+    """Create a policy from an already-instantiated model."""
+    repack_transforms = repack_transforms or transforms.Group()
+    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    if norm_stats is None:
+        norm_stats = data_config.norm_stats
+    if norm_stats is None and data_config.asset_id is not None:
+        norm_stats = _checkpoints.load_norm_stats(train_config.assets_dirs, data_config.asset_id)
+    if norm_stats is None:
+        raise ValueError("Norm stats are required to create a policy.")
+
+    if is_pytorch and pytorch_device is None:
+        try:
+            import torch
+
+            pytorch_device = "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            pytorch_device = "cpu"
+
+    return _policy.Policy(
+        model,
+        transforms=[
+            *repack_transforms.inputs,
+            transforms.InjectDefaultPrompt(default_prompt),
+            *data_config.data_transforms.inputs,
+            transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *data_config.model_transforms.inputs,
+        ],
+        output_transforms=[
+            *data_config.model_transforms.outputs,
+            transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *data_config.data_transforms.outputs,
+            *repack_transforms.outputs,
+        ],
+        sample_kwargs=sample_kwargs,
+        metadata=train_config.policy_metadata,
+        is_pytorch=is_pytorch,
+        pytorch_device=pytorch_device if is_pytorch else None,
+    )
+
+
 def create_trained_policy(
     train_config: _config.TrainConfig,
     checkpoint_dir: pathlib.Path | str,
@@ -55,40 +106,20 @@ def create_trained_policy(
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
-    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.
+        data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
-
-    # Determine the device to use for PyTorch models
-    if is_pytorch and pytorch_device is None:
-        try:
-            import torch
-
-            pytorch_device = "cuda" if torch.cuda.is_available() else "cpu"
-        except ImportError:
-            pytorch_device = "cpu"
-
-    return _policy.Policy(
+    return create_policy_from_model(
+        train_config,
         model,
-        transforms=[
-            *repack_transforms.inputs,
-            transforms.InjectDefaultPrompt(default_prompt),
-            *data_config.data_transforms.inputs,
-            transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.model_transforms.inputs,
-        ],
-        output_transforms=[
-            *data_config.model_transforms.outputs,
-            transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.data_transforms.outputs,
-            *repack_transforms.outputs,
-        ],
+        repack_transforms=repack_transforms,
         sample_kwargs=sample_kwargs,
-        metadata=train_config.policy_metadata,
+        default_prompt=default_prompt,
+        norm_stats=norm_stats,
+        pytorch_device=pytorch_device,
         is_pytorch=is_pytorch,
-        pytorch_device=pytorch_device if is_pytorch else None,
     )

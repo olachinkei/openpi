@@ -127,6 +127,18 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class EpisodeFilteredDataset(Dataset[T_co]):
+    def __init__(self, dataset: Dataset[T_co], indices: Sequence[int]):
+        self._dataset = dataset
+        self._indices = tuple(int(index) for index in indices)
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        return self._dataset[self._indices[index.__index__()]]
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -138,12 +150,34 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    video_backend = os.environ.get("OPENPI_VIDEO_BACKEND") or None
+    excluded: set[int] = set()
+    available_episodes = sorted(int(episode_index) for episode_index in dataset_meta.episodes)
+    if data_config.exclude_episodes:
+        excluded = {int(episode_index) for episode_index in data_config.exclude_episodes}
+        kept_episodes = [episode_index for episode_index in available_episodes if episode_index not in excluded]
+        if not kept_episodes:
+            raise ValueError(f"All episodes were excluded for repo_id={repo_id}.")
+        logging.info(
+            "Using %s/%s episodes for repo_id=%s after excluding held-out eval episodes: %s",
+            len(kept_episodes),
+            len(available_episodes),
+            repo_id,
+            sorted(excluded),
+        )
+
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        video_backend=video_backend,
     )
+    if excluded:
+        filtered_indices = [
+            index for index in range(len(dataset)) if int(dataset.hf_dataset[index]["episode_index"]) not in excluded
+        ]
+        dataset = EpisodeFilteredDataset(dataset, filtered_indices)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

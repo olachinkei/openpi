@@ -23,6 +23,7 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.eval_manifest as _eval_manifest
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
@@ -69,6 +70,8 @@ class DataConfig:
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
     norm_stats: dict[str, _transforms.NormStats] | None = None
+    # Episode indices to exclude from this dataset, typically a held-out eval split.
+    exclude_episodes: Sequence[int] = ()
 
     # Used to adopt the inputs from a dataset specific format to a common format
     # which is expected by the data transforms.
@@ -236,6 +239,8 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # the space used by the pi internal runtime which was used to train the base model. People who
     # use standard Aloha data should set this to true.
     adapt_to_pi: bool = True
+    # Optional eval manifest whose episode ids should be excluded from training.
+    exclude_episodes_manifest_path: str | None = None
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
@@ -268,6 +273,12 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             )
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        exclude_episodes: tuple[int, ...] = ()
+        if self.exclude_episodes_manifest_path is not None:
+            manifest_path = _eval_manifest.resolve_repo_path(self.exclude_episodes_manifest_path)
+            if manifest_path is None:
+                raise ValueError("exclude_episodes_manifest_path must resolve to a manifest path.")
+            exclude_episodes = _eval_manifest.load_manifest_episode_indices(manifest_path)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -275,6 +286,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+            exclude_episodes=exclude_episodes,
         )
 
 
@@ -466,7 +478,7 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
-    # Project name.
+    # Project name. WANDB_PROJECT can override this at runtime.
     project_name: str = "openpi"
     # Experiment name. Will be used to name the metadata and checkpoint directories.
     exp_name: str = tyro.MISSING
@@ -514,8 +526,13 @@ class TrainConfig:
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
+    # How many checkpoints to retain locally at once. Increase this when async consumers like periodic eval
+    # may still need an older checkpoint while a newer one is being saved.
+    checkpoint_max_to_keep: int = 1
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
+    # If false, only inference-ready params/assets are saved to reduce checkpoint memory pressure.
+    save_resume_state: bool = True
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -524,6 +541,50 @@ class TrainConfig:
 
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
+    # If true, publish dataset/input artifacts from the current run. Disabled by default when stable registry refs exist.
+    publish_dataset_artifacts: bool = False
+    # Optional W&B entity. If omitted, WANDB_ENTITY from the environment will be used.
+    wandb_entity: str | None = None
+    # Logical W&B run group, e.g. train / baseline_eval / periodic_eval / final_eval.
+    wandb_group: str | None = None
+    # W&B job type, defaults to train for the current training entrypoints.
+    wandb_job_type: str = "train"
+    # Explicit W&B tags only. Avoid encoding config metadata here; prefer config/summary fields for that.
+    wandb_tags: tuple[str, ...] = ()
+    # Optional checkpoint artifact upload cadence. Set to None to upload the final checkpoint only.
+    # Set to a negative value to disable checkpoint artifact uploads entirely.
+    wandb_checkpoint_artifact_interval: int | None = None
+
+    # Stable experiment metadata used by W&B tables and reports.
+    task_name: str | None = None
+    dataset_name: str | None = None
+    # Optional pre-registered dataset/input artifact refs to reuse instead of re-publishing every run.
+    train_dataset_artifact_ref: str | None = None
+    eval_dataset_artifact_ref: str | None = None
+    eval_final_dataset_artifact_ref: str | None = None
+    # Periodic eval manifest path, typically the fixed subsample eval split.
+    eval_manifest_path: str | None = None
+    # Slurm job script used to launch periodic eval on checkpoint saves.
+    eval_job_script_path: str | None = None
+    # Eval split label used for periodic checkpoint-triggered eval.
+    eval_split_name: str = "subsample"
+    # If set, overrides how many examples the periodic eval job should run.
+    periodic_eval_num_examples: int | None = None
+    # How evaluation should be launched. "slurm" submits a separate job, while "local" runs inline in the current job.
+    eval_execution_mode: Literal["slurm", "local"] = "slurm"
+    # If true, pause training after each checkpoint until periodic eval results are imported into the train run.
+    block_on_periodic_eval: bool = False
+    # Poll interval used while waiting for periodic/final eval result files to appear.
+    eval_results_poll_interval_secs: int = 15
+    # Optional final eval manifest path. When set, a final eval job can be submitted after training completes.
+    final_eval_manifest_path: str | None = None
+    # Optional Slurm job script used to launch final eval. If omitted, eval_job_script_path can be reused.
+    final_eval_job_script_path: str | None = None
+    # Eval split label used for final-eval checkpoint submission.
+    final_eval_split_name: str = "full"
+    # If set, overrides how many examples the final eval job should run. Use 0 to run all manifest records.
+    final_eval_num_examples: int | None = None
+    baseline_checkpoint_ref: str | None = None
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -554,6 +615,8 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.resume and not self.save_resume_state:
+            raise ValueError("Cannot resume training when save_resume_state is disabled.")
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -921,14 +984,33 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi0_aloha_sim",
+        project_name="openpi-aloha",
         model=pi0_config.Pi0Config(),
         data=LeRobotAlohaDataConfig(
             repo_id="lerobot/aloha_sim_transfer_cube_human",
             default_prompt="Transfer cube",
             use_delta_joint_actions=False,
+            exclude_episodes_manifest_path="manifests/aloha_sim_transfer_cube/eval_dataset_full.json",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
+        save_resume_state=False,
+        wandb_group="train",
+        wandb_checkpoint_artifact_interval=5_000,
+        task_name="Transfer cube",
+        dataset_name="lerobot/aloha_sim_transfer_cube_human",
+        train_dataset_artifact_ref="wandb32/wandb-registry-Physical AI - openpi/training dataset:v0",
+        eval_dataset_artifact_ref="wandb32/wandb-registry-Physical AI - openpi/evaluation dataset for openpi:v0",
+        eval_final_dataset_artifact_ref="wandb32/wandb-registry-Physical AI - openpi/evaluation dataset for openpi:v1",
+        eval_manifest_path="manifests/aloha_sim_transfer_cube/eval_dataset_subsample.json",
+        eval_job_script_path="jobs/eval_aloha_sim.sbatch",
+        periodic_eval_num_examples=4,
+        eval_execution_mode="local",
+        block_on_periodic_eval=True,
+        final_eval_manifest_path="manifests/aloha_sim_transfer_cube/eval_dataset_full.json",
+        final_eval_num_examples=0,
+        checkpoint_max_to_keep=2,
+        baseline_checkpoint_ref="gs://openpi-assets/checkpoints/pi0_aloha_sim",
     ),
     #
     # Debugging configs.

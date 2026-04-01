@@ -1,0 +1,59 @@
+{
+  "$schema": "../../schemas/eval_manifest.schema.json",
+  "manifest_version": "1.0",
+  "name": "aloha_sim_transfer_cube_eval_subsample",
+  "environment_family": "ALOHA_SIM",
+  "task_name": "Transfer cube",
+  "config_name": "pi0_aloha_sim",
+  "dataset_name": "lerobot/aloha_sim_transfer_cube_human",
+  "split_name": "subsample",
+  "prompt": "Transfer cube",
+  "selection": {
+    "policy": "fixed_prefix_of_full_eval",
+    "source": "manifests/aloha_sim_transfer_cube/eval_dataset_full.json",
+    "seed": 42,
+    "notes": "Fixed 4-episode prefix of the seeded full eval manifest."
+  },
+  "records": [
+    {
+      "example_id": "episode_025",
+      "episode_id": "episode_000025",
+      "prompt": "Transfer cube",
+      "hf_episode_index": 25,
+      "metadata": {
+        "seed": 25,
+        "source_episode_index": 25
+      }
+    },
+    {
+      "example_id": "episode_023",
+      "episode_id": "episode_000023",
+      "prompt": "Transfer cube",
+      "hf_episode_index": 23,
+      "metadata": {
+        "seed": 23,
+        "source_episode_index": 23
+      }
+    },
+    {
+      "example_id": "episode_019",
+      "episode_id": "episode_000019",
+      "prompt": "Transfer cube",
+      "hf_episode_index": 19,
+      "metadata": {
+        "seed": 19,
+        "source_episode_index": 19
+      }
+    },
+    {
+      "example_id": "episode_011",
+      "episode_id": "episode_000011",
+      "prompt": "Transfer cube",
+      "hf_episode_index": 11,
+      "metadata": {
+        "seed": 11,
+        "source_episode_index": 11
+      }
+    }
+  ]
+}

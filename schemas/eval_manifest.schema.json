@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openpi/schemas/eval_manifest.schema.json",
+  "title": "OpenPI Eval Manifest",
+  "type": "object",
+  "required": [
+    "manifest_version",
+    "name",
+    "environment_family",
+    "task_name",
+    "config_name",
+    "dataset_name",
+    "split_name",
+    "prompt",
+    "selection",
+    "records"
+  ],
+  "properties": {
+    "manifest_version": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "environment_family": {
+      "type": "string"
+    },
+    "task_name": {
+      "type": "string"
+    },
+    "config_name": {
+      "type": "string"
+    },
+    "dataset_name": {
+      "type": "string"
+    },
+    "split_name": {
+      "type": "string",
+      "enum": [
+        "full",
+        "subsample"
+      ]
+    },
+    "prompt": {
+      "type": "string"
+    },
+    "selection": {
+      "type": "object",
+      "required": [
+        "policy",
+        "source"
+      ],
+      "properties": {
+        "policy": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "seed": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "notes": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "example_id"
+        ],
+        "properties": {
+          "example_id": {
+            "type": "string"
+          },
+          "episode_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hf_episode_index": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "metadata": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -27,6 +27,7 @@ import dataclasses
 import gc
 import logging
 import os
+import pathlib
 import platform
 import shutil
 import time
@@ -45,6 +46,11 @@ import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+import openpi.training.dataset_artifacts as _dataset_artifacts
+import openpi.training.eval_submission as _eval_submission
+import openpi.training.eval_tracking as _eval_tracking
+import openpi.utils.wandb.artifacts as _wandb_artifacts
+import openpi.utils.wandb.run_context as _wandb_run_context
 
 
 def init_logging():
@@ -71,24 +77,13 @@ def init_logging():
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
     """Initialize wandb logging."""
-    if not enabled:
-        wandb.init(mode="disabled")
-        return
-
-    ckpt_dir = config.checkpoint_dir
-    if not ckpt_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
-    else:
-        wandb.init(
-            name=config.exp_name,
-            config=dataclasses.asdict(config),
-            project=config.project_name,
-        )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+    return _wandb_run_context.WandbRunContext.init_for_training(
+        config,
+        backend="pytorch",
+        resuming=resuming,
+        enabled=enabled,
+        log_code_root=pathlib.Path(__file__).resolve().parent.parent,
+    )
 
 
 def setup_ddp():
@@ -146,13 +141,26 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(
+    model,
+    optimizer,
+    global_step,
+    config,
+    is_main,
+    data_config,
+    artifact_manager=None,
+    wandb_run=None,
+    dataset_artifact_refs=None,
+    periodic_eval_dependency_job_id=None,
+):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
-        return
+        return periodic_eval_dependency_job_id
+
+    next_periodic_eval_dependency_job_id = periodic_eval_dependency_job_id
 
     # Only save if it's time to save or if it's the final step
-    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
+    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps:
         # Create temporary directory for atomic checkpoint saving
         final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
         tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
@@ -190,8 +198,54 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
         # Log checkpoint to wandb
-        if config.wandb_enabled:
-            wandb.log({"checkpoint_step": global_step}, step=global_step)
+        if config.wandb_enabled and wandb.run is not None:
+            wandb.log({"train/checkpoint_step": global_step}, step=global_step)
+            wandb.run.summary["train/checkpoint_step"] = global_step
+
+        job_id = _eval_submission.maybe_submit_periodic_eval(
+            config,
+            checkpoint_step=global_step,
+            dependency_job_id=periodic_eval_dependency_job_id,
+        )
+        if job_id is not None:
+            next_periodic_eval_dependency_job_id = job_id
+            if wandb_run is not None:
+                eval_prefix = _eval_tracking.metric_namespace_for_split(config.eval_split_name)
+                wandb_run.log_summary(
+                    {
+                        f"{eval_prefix}/last_submitted_job_id": job_id,
+                        f"{eval_prefix}/last_submitted_checkpoint_step": global_step,
+                    }
+                )
+
+        if config.wandb_enabled and wandb.run is not None:
+            if artifact_manager is not None and _wandb_artifacts.should_publish_checkpoint_artifact(
+                global_step,
+                final_step=config.num_train_steps,
+                interval=config.wandb_checkpoint_artifact_interval,
+            ):
+                artifact_manager.log_checkpoint_directory(
+                    final_ckpt_dir,
+                    artifact_name=f"{config.name}-{config.exp_name}",
+                    aliases=_wandb_artifacts.build_checkpoint_aliases(
+                        global_step,
+                        is_final=global_step == config.num_train_steps,
+                    ),
+                    metadata={
+                        "backend": "pytorch",
+                        "config_name": config.name,
+                        "task_name": config.task_name,
+                        "dataset_name": config.dataset_name,
+                        "checkpoint_step": global_step,
+                        "train_dataset_artifact": None if dataset_artifact_refs is None else dataset_artifact_refs.get("train"),
+                        "eval_dataset_artifact": None if dataset_artifact_refs is None else dataset_artifact_refs.get("eval"),
+                        "eval_final_dataset_artifact": None
+                        if dataset_artifact_refs is None
+                        else dataset_artifact_refs.get("eval_final"),
+                    },
+                )
+
+    return next_periodic_eval_dependency_job_id
 
 
 def load_checkpoint(model, optimizer, checkpoint_dir, device):
@@ -343,8 +397,32 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
 
     # Initialize wandb (only on main process)
+    wandb_run = None
+    artifact_manager = None
+    dataset_artifact_refs = {}
     if is_main:
-        init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+        dataset_artifact_refs = _dataset_artifacts.publish_dataset_artifacts(
+            config,
+            backend="pytorch",
+            enabled=config.wandb_enabled,
+        )
+        wandb_run = init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+        artifact_manager = _wandb_artifacts.WandbArtifactManager()
+        if dataset_artifact_refs:
+            if wandb.run is not None:
+                for artifact_ref in dataset_artifact_refs.values():
+                    if artifact_ref:
+                        wandb.run.use_artifact(artifact_ref)
+        else:
+            dataset_artifact_refs = _dataset_artifacts.register_dataset_artifacts(config, artifact_manager)
+        if wandb_run is not None:
+            wandb_run.log_summary(
+                {
+                    "data/train_dataset_artifact": dataset_artifact_refs.get("train"),
+                    "data/eval_dataset_artifact": dataset_artifact_refs.get("eval"),
+                    "data/eval_final_dataset_artifact": dataset_artifact_refs.get("eval_final"),
+                }
+            )
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
@@ -357,37 +435,6 @@ def train_loop(config: _config.TrainConfig):
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
     loader, data_config = build_datasets(config)
-
-    # Log sample images to wandb on first batch
-    if is_main and config.wandb_enabled and not resuming:
-        # Create a separate data loader for sample batch to avoid consuming the main loader
-        sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
-        sample_batch = next(iter(sample_data_loader))
-        # Convert observation and actions to torch tensors
-        observation, actions = sample_batch
-        sample_batch = observation.to_dict()
-        sample_batch["actions"] = actions
-
-        # Create sample images for wandb
-        images_to_log = []
-        # Get batch size from the first image tensor
-        batch_size = next(iter(sample_batch["image"].values())).shape[0]
-        for i in range(min(5, batch_size)):
-            # Concatenate all camera views horizontally for this batch item
-            # Convert from NCHW to NHWC format for wandb
-            img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
-            img_concatenated = img_concatenated.cpu().numpy()
-            images_to_log.append(wandb.Image(img_concatenated))
-
-        wandb.log({"camera_views": images_to_log}, step=0)
-
-        # Clear sample batch from memory aggressively
-        del sample_batch, observation, actions, images_to_log, img_concatenated
-        del sample_data_loader  # Also delete the sample data loader
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
     if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
@@ -506,6 +553,7 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
+    last_eval_job_id = None
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
@@ -590,19 +638,30 @@ def train_loop(config: _config.TrainConfig):
                     log_payload = {
                         "loss": avg_loss,
                         "learning_rate": avg_lr,
-                        "step": global_step,
-                        "time_per_step": elapsed / config.log_interval,
+                        "checkpoint_step": global_step,
+                        "step_time_sec": elapsed / config.log_interval,
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
-                    wandb.log(log_payload, step=global_step)
+                    wandb_run.log_metrics(log_payload, step=global_step, prefix="train")
 
                 start_time = time.time()
                 infos = []  # Reset stats collection
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            last_eval_job_id = save_checkpoint(
+                model,
+                optim,
+                global_step,
+                config,
+                is_main,
+                data_config,
+                artifact_manager,
+                wandb_run,
+                dataset_artifact_refs,
+                last_eval_job_id,
+            )
 
             # Update progress bar
             if pbar is not None:
@@ -616,8 +675,21 @@ def train_loop(config: _config.TrainConfig):
         pbar.close()
 
     # Finish wandb run
-    if is_main and config.wandb_enabled:
-        wandb.finish()
+    if is_main and config.wandb_enabled and wandb_run is not None:
+        job_id = _eval_submission.maybe_submit_final_eval(
+            config,
+            checkpoint_step=global_step,
+            dependency_job_id=last_eval_job_id,
+        )
+        if job_id is not None:
+            eval_prefix = _eval_tracking.metric_namespace_for_split(config.final_eval_split_name)
+            wandb_run.log_summary(
+                {
+                    f"{eval_prefix}/last_submitted_job_id": job_id,
+                    f"{eval_prefix}/last_submitted_checkpoint_step": global_step,
+                }
+            )
+        wandb_run.finish()
 
     cleanup_ddp()
 

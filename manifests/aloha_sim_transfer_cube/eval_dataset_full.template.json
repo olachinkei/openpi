@@ -1,0 +1,18 @@
+{
+  "$schema": "../../schemas/eval_manifest.schema.json",
+  "manifest_version": "1.0",
+  "name": "aloha_sim_transfer_cube_eval_full",
+  "environment_family": "ALOHA_SIM",
+  "task_name": "Transfer cube",
+  "config_name": "pi0_aloha_sim",
+  "dataset_name": "lerobot/aloha_sim_transfer_cube_human",
+  "split_name": "full",
+  "prompt": "Transfer cube",
+  "selection": {
+    "policy": "held_out_eval",
+    "source": "lerobot/aloha_sim_transfer_cube_human",
+    "seed": 42,
+    "notes": "Populate with the full held-out evaluation set. This template is tracked before the eval runner exists."
+  },
+  "records": []
+}

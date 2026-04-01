@@ -1,0 +1,119 @@
+{
+  "$schema": "../../schemas/eval_manifest.schema.json",
+  "manifest_version": "1.0",
+  "name": "aloha_sim_transfer_cube_eval_full",
+  "environment_family": "ALOHA_SIM",
+  "task_name": "Transfer cube",
+  "config_name": "pi0_aloha_sim",
+  "dataset_name": "lerobot/aloha_sim_transfer_cube_human",
+  "split_name": "full",
+  "prompt": "Transfer cube",
+  "selection": {
+    "policy": "seeded_holdout_from_train_only_dataset",
+    "source": "lerobot/aloha_sim_transfer_cube_human",
+    "seed": 42,
+    "notes": "Dataset exposes only a train split, so this manifest defines a deterministic held-out eval subset of 10 episodes from total_episodes=50."
+  },
+  "records": [
+    {
+      "example_id": "episode_025",
+      "episode_id": "episode_000025",
+      "prompt": "Transfer cube",
+      "hf_episode_index": 25,
+      "metadata": {
+        "seed": 25,
+        "source_episode_index": 25
+      }
+    },
+    {
+      "example_id": "episode_023",
+      "episode_id": "episode_000023",
+      "prompt": "Transfer cube",
+      "hf_episode_index": 23,
+      "metadata": {
+        "seed": 23,
+        "source_episode_index": 23
+      }
+    },
+    {
+      "example_id": "episode_019",
+      "episode_id": "episode_000019",
+      "prompt": "Transfer cube",
+      "hf_episode_index": 19,
+      "metadata": {
+        "seed": 19,
+        "source_episode_index": 19
+      }
+    },
+    {
+      "example_id": "episode_011",
+      "episode_id": "episode_000011",
+      "prompt": "Transfer cube",
+      "hf_episode_index": 11,
+      "metadata": {
+        "seed": 11,
+        "source_episode_index": 11
+      }
+    },
+    {
+      "example_id": "episode_004",
+      "episode_id": "episode_000004",
+      "prompt": "Transfer cube",
+      "hf_episode_index": 4,
+      "metadata": {
+        "seed": 4,
+        "source_episode_index": 4
+      }
+    },
+    {
+      "example_id": "episode_045",
+      "episode_id": "episode_000045",
+      "prompt": "Transfer cube",
+      "hf_episode_index": 45,
+      "metadata": {
+        "seed": 45,
+        "source_episode_index": 45
+      }
+    },
+    {
+      "example_id": "episode_026",
+      "episode_id": "episode_000026",
+      "prompt": "Transfer cube",
+      "hf_episode_index": 26,
+      "metadata": {
+        "seed": 26,
+        "source_episode_index": 26
+      }
+    },
+    {
+      "example_id": "episode_009",
+      "episode_id": "episode_000009",
+      "prompt": "Transfer cube",
+      "hf_episode_index": 9,
+      "metadata": {
+        "seed": 9,
+        "source_episode_index": 9
+      }
+    },
+    {
+      "example_id": "episode_029",
+      "episode_id": "episode_000029",
+      "prompt": "Transfer cube",
+      "hf_episode_index": 29,
+      "metadata": {
+        "seed": 29,
+        "source_episode_index": 29
+      }
+    },
+    {
+      "example_id": "episode_016",
+      "episode_id": "episode_000016",
+      "prompt": "Transfer cube",
+      "hf_episode_index": 16,
+      "metadata": {
+        "seed": 16,
+        "source_episode_index": 16
+      }
+    }
+  ]
+}
