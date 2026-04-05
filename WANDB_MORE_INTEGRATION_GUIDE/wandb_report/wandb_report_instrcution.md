@@ -2,6 +2,12 @@
 
 This document organizes the main OpenPI W&B integration changes for the report. Each section starts with the workflow issue we wanted to solve, then summarizes the corresponding changes.
 
+Overview reports:
+English: https://wandb.ai/wandb-smle/openpi-aloha-wandb-integration/reports/OpenPI-x-W-B--VmlldzoxNjQyMzc4Mg
+Japanese: https://wandb.ai/wandb-smle/openpi-aloha-wandb-integration/reports/OpenPI-x-W-B--VmlldzoxNjQxNjczNQ
+
+
+
 ## Code Change Notes
 
 The sections below are organized around the workflow improvements that matter most in the report.  
