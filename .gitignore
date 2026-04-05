@@ -4,6 +4,11 @@ checkpoints/
 data/
 wandb/
 
+# Local report drafts.
+WANDB_MORE_INTEGRATION_GUIDE/wandb_report/report_integration.md
+WANDB_MORE_INTEGRATION_GUIDE/wandb_report/wandb_report_en.md
+WANDB_MORE_INTEGRATION_GUIDE/wandb_report/wandb_report_jp.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

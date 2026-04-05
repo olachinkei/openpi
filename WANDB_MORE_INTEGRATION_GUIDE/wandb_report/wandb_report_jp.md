@@ -1,341 +1,246 @@
-# OpenPI x W&B: Physical AIワークフローの統合ガイド
-
----
+# OpenPI x W&B: Physical AI ワークフローをつなぐ統合ガイド
 
 ## はじめに
 
-[OpenPI](https://github.com/Physical-Intelligence/openpi) は、Physical AI 領域で急速に注目を集めているオープンソースの汎用ロボット制御フレームワークです。PyTorch ベースの学習ループを持ち、W&B との基本的な連携（loss や learning rate のロギング）は既に備わっています。
+[OpenPI](https://github.com/Physical-Intelligence/openpi) は、[Physical Intelligence](https://www.physicalintelligence.company/) が公開しているオープンソースのロボティクス向けフレームワークで、Physical AI 領域で急速に注目を集めています。本レポートでは Physical AI の開発でより便利に W&B を使う方法を OpenPI を例に解説していきます。OpenPI は JAX と PyTorch の両方に対応しており、W&B との基本的な連携（loss や learning rate のロギング）は既に備わっていますが、追加でシミュレーション結果の可視化などの integration 機能も実装しています。
 
-しかし、実際の研究・開発ワークフローでは「学習メトリクスの記録」だけでは不十分です。複数の実験を効率的に比較し、評価結果をシミュレーション動画と共に可視化し、チェックポイントを体系的に管理する――こうした一連のワークフローが求められます。
+- [integrationを追加したgithub**](https://github.com/olachinkei/openpi) : 
+- W&B Project（OpenPI integration 例）: 
 
-本レポートでは、OpenPI に対して追加実装した W&B 統合の全体像を紹介します。IsaacSim のようなシミュレータにはネイティブな可視化連携が存在しますが、OpenPI のコードベースにはそれがありません。本プロジェクトでは、その不足を補い、Physical AI 開発における W&B の活用パターンを実証しました。
+OpenPI を例に、Physical AI における W&B の便利な使い方について、順番にみていきましょう。なお、追加 integration の技術的な実装の詳細については、[GitHub リポジトリのReadme](https://github.com/olachinkei/openpi)を参照してください。
 
-技術的な実装の詳細については、[GitHub リポジトリ](https://github.com/olachinkei/openpi)を参照してください。
+なお、Physical AIにおけるW&Bの価値を解説したWhite Paperや一般的なデモ動画（こちらはIssacLabの例）もありますので、あわせてご参照ください。
 
----
+- [White Paper : Advancing Physical AI: From learning to embodied intelligence](https://wandb.ai/site/resources/whitepapers/advancing-physical-ai/)
+- [W&B デモ動画 （IsaacLab）](https://www.youtube.com/watch?v=45Beo0ZkJJA)
+- [W&B Projectの例（IsaacLab）](https://wandb.ai/wandb-smle/isaaclab-wandb-crwv?nw=nwuseranushravvatsa)
 
-## 参考リンク
+AI の開発では、1 本の学習 run から大量の情報が生まれます。train loss だけでなく、評価用の episode 一覧、checkpoint、成功率、最大報酬まで見ないと、モデルの良し悪しを判断できません。ところが、これらが別々のスクリプト、別々の job、別々の保存先に散らばると、比較は一気に難しくなります。また、特にPhysical AIでは、metricsだけではなく、シミュレーションの可視化も重要になります。
 
-- **GitHub（拡張 W&B 統合版）**: https://github.com/olachinkei/openpi
-- **YouTube（Physical AI x W&B デモ）**: https://www.youtube.com/watch?v=45Beo0ZkJJA
-- **W&B Project（OpenPI 統合）**: <!-- プロジェクト URL を挿入 -->
-- **参考: W&B Project（IsaacLab）**: https://wandb.ai/wandb-smle/isaaclab-wandb-crwv?nw=nwuseranushravvatsa
-
----
-
-## 概要: 何を実装したか
-
-### 題材
-
-ALOHA Sim 環境の **Transfer Cube** タスクを題材に、`pi0_aloha_sim` 設定を使用してエンドツーエンドの学習・評価・管理ワークフローを構築しました。ALOHA Sim は再現性の高いシミュレーション環境であり、繰り返し評価に適しているため、W&B 統合のデモ対象として最適です。
-
-この題材で解いている課題は、**2 本腕の ALOHA ロボットがキューブを把持し、受け渡し、安定して保持できるようにすること**です。OpenPI では `lerobot/aloha_sim_transfer_cube_human` のデモデータを使って、模倣学習ベースで方策を学習します。
-
-データセットは役割ごとに 3 つに分かれます。
-
-- **training dataset**: 学習に使うデモデータ本体。最終評価に使う held-out episode は除外しています
-- **中間 eval 用 dataset**: 学習中の checkpoint を軽く比較するための小さな固定サブセット
-- **最終 eval 用 dataset**: 学習に使わない held-out episode 群。最終比較用の評価セット
-
-今回の W&B 連携では、このタスクに対して次のような metric を記録しています。
-
-- **`primary_score`**: そのタスクで最も重要な代表スコアです。**Transfer Cube では `success_rate` と同じ値**を使っています。つまり「何本のエピソードが成功したか」を、run 間比較の代表値として使っています
-- **`success_rate`**: 評価エピソードのうち、成功条件を満たした割合です。Transfer Cube では最も分かりやすい主指標です
-- **`mean_max_reward`**: 各エピソードで到達した最大報酬の平均です。成功まで届かなくても、どれだけ目標に近づいたかを滑らかに見られます
-- **`num_examples`**: その評価で実際に回したエピソード数です
-- **`checkpoint_step`**: どの checkpoint を評価した結果かを示します
-- **`train/loss`**: 模倣学習の学習損失です。低いほど、デモ行動の再現誤差が小さいことを示します
-- **`train/grad_norm`**: 勾配の大きさです。学習が不安定になっていないかを見るための補助指標です
-- **`train/param_norm`**: モデル重み全体の大きさです。学習の発散や異常を検知する補助指標です
-
-要するに、この題材では **「最終的にタスクを成功できるか」** を `success_rate` / `primary_score` で見つつ、**「そこに向かってどれだけ近づいているか」** を `mean_max_reward` で補完しています。
-
-### 追加した W&B 統合
-
-本プロジェクトでは、以下の統合を OpenPI に追加しました。
-
-1. **学習メトリクスの標準化と実験比較基盤** — config、tags、メタデータの構造化により、Workspace 上での複数実験の効率的な比較を実現
-2. **評価パイプライン** — 評価データセットに対するシミュレーション実行とメトリクス・動画の自動ロギング（`scripts/eval_aloha_dataset.py`）
-3. **W&B Table による Leaderboard** — 1 run = 1 行の評価結果テーブルで、複数実験のスコアを一覧比較
-4. **シミュレーション動画の可視化** — ロールアウト動画を W&B Media Panel にロギングし、定性的な評価を可能に
-5. **Artifacts によるチェックポイント管理** — マイルストーンチェックポイントのバージョン管理とリネージ追跡
-
-汎用的な W&B ユーティリティレイヤーとして `src/openpi/utils/wandb/` を構築し、タスク固有のロジックとの分離を実現しています。
+そこで、OpenPIのコードに以下の観点で追加のintegrationを開発しました。
+1. 実験比較基盤の強化
+2. 可視化を伴う評価パイプラインの強化
+3. Artifacts / Registry を使ったアセット管理
+本レポートでは、追加integrationと合わせて、それを活用したUI上の便利な操作も解説していきます。
 
 ---
 
-## 学習: 複数実験の効率的な比較
+## 今回の題材: ALOHA Sim Transfer Cube
 
-大量の実験を行った際に、それらを容易かつ体系的に比較できることは、研究の生産性に直結します。W&B では、`wandb.init` 時に適切なメタデータを記録しておくことで、後から Workspace 上で柔軟な分析が可能になります。
+今回のデモでは、2 本腕の ALOHA ロボットがキューブを把持し、受け渡しし、安定して保持する **Transfer Cube** タスクを使いました。学習データは `lerobot/aloha_sim_transfer_cube_human`、設定は `pi0_aloha_sim` です。
 
-### Config の記録
+このデータセットは全 50 episode で、この設定ではそのうち 10 episode を held-out の final eval 用に切り出し、学習には残り 40 episode を使います。さらに periodic eval では、その held-out 10 episode のうち固定の 4 episode を使います。学習は 20,000 step まで行います。
 
-本プロジェクトでは、`src/openpi/utils/wandb/run_context.py` の `WandbRunContext` クラスが、config name、task name、dataset name、backend、Git SHA、ホスト情報などを自動的に `wandb.config` に記録します。これにより、すべての run が一貫したメタデータを持ち、後からのフィルタリング・比較が容易になります。
+今回は W&B 上で学習・評価・アセット管理をどうつなぐかを示すデモストレーションが主目的のため、データセット規模は小さめです。そのため、ここでの結果は厳密なベンチマークや統計的に頑健な性能比較というより、ワークフローを確認するための例として参考にされてください。
 
-<details>
-<summary>parameter / config の詳細を見る</summary>
+
+---
+
+## 1. 実験比較基盤の強化
+
+### config に実験条件を詳細に保存
+W&B では、loss のような時系列データだけでなく、各 run の条件を `config` に残せます。`config_name`、`task_name`、`dataset_name`、`backend`、`git sha`、`hostname` のような情報を入れておくと、あとから Workspace 上で特定の条件だけを絞り込んだり、あるパラメータごとに run を見比べたりしやすくなります。後で紹介するように、config の値を使って表示色を分けることもできます。
+
+もともとの OpenPI の W&B integration では、比較に使いたい情報が `config` に十分そろっていませんでした。そこで OpenPI 側では `src/openpi/utils/wandb/run_context.py` を追加し、W&B run の初期化処理を共通化しました。これにより、後で比較や整理に使いやすい項目を、`wandb.config` に残せるようにしています。JAX と PyTorch のどちらを使う場合でも、同じ考え方で metadata を残せるようにしています。
+
+例えば、W&B では次のようなイメージで run 情報を構造化できます。
 
 ```python
 import wandb
 
-with wandb.init(
-    project="openpi-aloha",
-    notes="ALOHA Sim Transfer Cube baseline",
-    tags=["baseline", "aloha_sim"],
+wandb.init(
+    project="openpi-integration",
     config={
         "config_name": "pi0_aloha_sim",
-        "task_name": "transfer_cube",
-        "backend": "pytorch",
-        "learning_rate": 2.5e-5,
-        "batch_size": 64,
+        "task_name": "Transfer cube",
+        "dataset_name": "lerobot/aloha_sim_transfer_cube_human",
+        "training_backend": "jax",
     },
-) as run:
-    ...
+    tags=["aloha", "transfer-cube"],
+)
 ```
 
-- `config_name`: どの学習設定を使った run か
-- `task_name`: 今回解いているロボットタスク名
-- `backend`: JAX / PyTorch などの実装系
-- `learning_rate`: 最適化のステップ幅
-- `batch_size`: 1 step でまとめて使うデータ数
-- `tags`: baseline / ablation / test など、人間が run を整理しやすくするラベル
 
-</details>
+### Workspace 上で大量の実験を比較する
 
-config の詳細: https://docs.wandb.ai/models/track/config
+上記のconfigをもとに、W&B の Workspace 上で大量の run を比較する便利な機能を順に見ていきましょう。
 
----
+### 便利機能 1: Parallel Coordinates Chart
 
-### Parallel Coordinates Chart
+[Parallel Coordinates Chart](https://docs.wandb.ai/models/app/features/panels/parallel-coordinates) は、複数のハイパーパラメータと結果指標の関係を一枚で俯瞰できるパネルです。例えば `learning_rate`、`batch_size`、`training_backend`、`eval/success_rate`、`eval_final/primary_score` を軸に置くと、どの設定の run が高い成功率につながったかを視覚的に追えます。
 
-Parallel Coordinates Chart は、ハイパーパラメータと結果メトリクスの関係を一つのチャートで俯瞰できるパネルです。
+follow-up 実験を何本も回す場面では、「良さそうな run の帯」が見えるだけでも有用です。loss の最終値だけでは判断しづらいときでも、成功率や reward と一緒に見ると、設定と結果の関係が読みやすくなります。
 
-**主な活用方法:**
-- 各軸にハイパーパラメータ（学習率、バッチサイズ、モデルファミリーなど）と結果メトリクス（eval loss、success rate など）を配置
-- 複数の run がライン（線）として描画され、パラメータの組み合わせと結果の相関を直感的に把握可能
-- 軸上の範囲をドラッグして選択すると、該当する run のみがハイライトされ、インタラクティブに絞り込みが可能
 
-<!-- 実際の run の Parallel Coordinates Chart のスクリーンショットを挿入 -->
+大量の探索を手動で回す場合、毎回コマンドや設定を変えて job を投げる必要があります。**W&B Sweeps** を使うと、探索空間を YAML で定義し、`wandb agent` が候補設定の選定と run 起動を自動化することができます。今回は利用していませんが、簡単に使えるので、是非ご確認ください。
 
-詳細: https://docs.wandb.ai/models/app/features/panels/parallel-coordinates
 
-#### W&B Sweeps によるハイパーパラメータ探索の自動化
+### 便利機能 2: Pinned Runs と Baseline Comparison
 
-手動で大量の run を回してハイパーパラメータを探索することも可能ですが、**W&B Sweeps** を使うことで、このプロセスを自動化できます。
+Pinned Runs は、比較の基準にしたい run を常に上部に残しておく機能です。新しい実験を何本も追加しても、ベースライン run が見失われにくくなります。
 
-**手動実行の場合:**
-- 実行方法: 各パラメータを手動で設定し、個別に run を起動
-- 探索戦略: 研究者の経験と直感に依存
-- スケーラビリティ: 実験数が増えると管理が困難
-- 早期終了: 手動判断
+Baseline Comparison を併用すると、ラインプロット上で基準 run が強調されるため、「新しい run は本当に改善したのか」を短時間で判断できます。例えば公開 checkpoint を基準にして fine-tuning run を比べる、といった使い方がしやすくなります。
 
-**W&B Sweeps の場合:**
-- 実行方法: YAML で探索空間を定義し、`wandb agent` がパラメータの選択と run の起動を自動実行
-- 探索戦略: Grid / Random / Bayesian（ベイズ最適化）から選択可能
-- スケーラビリティ: Controller が複数の Agent を協調させ、大規模探索を効率的に実行
-- 早期終了: Hyperband 等のアルゴリズムによる自動早期終了をサポート
-
-Sweeps は特に、探索すべきパラメータの組み合わせが多い場合に有効です。
-
----
-
-### Pinned Runs & Baseline Comparison
-
-ベースラインとなる run を設定し、最大 5 つの run をピン留めすることで、フィルタ条件に関係なく、常に Run Selector の上部に表示させることができます。
-
-**主な利点:**
-- ベースライン run がライングラフ上でハイライト表示され、新しい実験との差分が一目で分かる
-- フィルタを変更しても比較対象が維持されるため、分析の文脈が失われない
+![Pinned Runs と Baseline Comparison](https://mintcdn.com/wb-21fd5541/57wwTAGN9Q-FX-xN/images/models/pinned-and-baseline-runs/runs-table-with-pinned-and-baseline-runs.png?w=1100&fit=max&auto=format&n=57wwTAGN9Q-FX-xN&q=85&s=288f18afe190c9e11ce65f9e3b3086e1)
 
 デモ動画: https://www.loom.com/share/b8a5352c01594778ac38ff0ad5fa18d8
 
----
 
-### Semantic Colors by Config Values
+### 便利機能 3: Semantic Colors by Config Values
 
-Config 値（ハイパーパラメータ）に基づいて run の色を自動で割り当てる機能です。
+Semantic Colors by Config Values は、Config 値に応じて run の色を自動で付ける機能です。学習率ごと、モデル family ごと、backend ごとに色が揃うだけで、グラフの読みやすさはかなり変わります。
 
-**主な利点:**
-- 学習率やバッチサイズ、モデルファミリーなどの Config 値に応じて run の色が自動設定される
-- 集約（Aggregation）を必要とせず、個々の run レベルでConfig の影響を視覚的に把握できる
-- 他のメンバーの Workspace でも Semantic Legend が利用可能で、チーム内での共有・議論が容易
+例えば、`training_backend=jax` と `training_backend=pytorch` の色が自動で分かれると、同じ Workspace 上で backend 差の傾向を直感的に追えます。集約前の個々の run が見やすいので、follow-up 実験の判断も速くなります。
 
-大量の run を比較する際に、パラメータごとの傾向やパターンを素早く発見でき、洞察のスピードが大幅に向上します。
+![Semantic Colors by Config Values](https://mintcdn.com/wb-21fd5541/_OEDykSS2PIumrEw/images/track/color-code-runs-plot.png?w=1100&fit=max&auto=format&n=_OEDykSS2PIumrEw&q=85&s=93b9f741937503187baa665f41568973)
 
 デモ動画: https://www.loom.com/share/640c6d2c04ec4c328c92b530516778bd
 
----
+### 便利機能 4: Saved Views
 
-### Saved Views
+W&B Workspace の [Saved Views](https://docs.wandb.ai/models/track/workspaces) は、パネル配置、filter 条件、色分け、表示対象をそのまま保存できる機能です。
 
-W&B Workspace の **Saved Views** 機能を使うと、パネルの配置・フィルタ条件・表示設定を「ビュー」として保存し、いつでも再利用できます。
+これは単なるレイアウト保存ではありません。研究の観点そのものを保存できるのが重要です。例えば次のような view を分けておくと便利です。
 
-**主な利点:**
-- 分析の目的（学習曲線の比較、評価スコアの確認、動画レビューなど）に応じた専用ビューを作成
-- チームメンバーとビューを共有し、同じ視点での議論が可能
-- 個人用のビューとチーム共有のビューを分離して管理
+- 学習確認用: `train/loss` と `train/grad_norm` を中心に見る view
+- 中間評価確認用: `eval/success_rate` と `eval/leaderboard` を中心に見る view
+- 動画レビュー用: `eval_final/videos` を中心に見る view
 
-![Saved Views メニュー](https://mintcdn.com/wb-21fd5541/4kbs1cW6PdjDOqU3/images/app_ui/Menu_Views.jpg?w=2500&fit=max&auto=format&n=4kbs1cW6PdjDOqU3&q=85&s=9b6ce8a5be6b812d6d3520af75e75bbc)
+チームで同じ Saved View を共有しておくと、「どの画面を見ながら議論しているか」が揃います。これだけでもレビューの速度はかなり変わります。
 
-詳細: https://docs.wandb.ai/models/track/workspaces
+![Saved Views メニュー](https://mintcdn.com/wb-21fd5541/4kbs1cW6PdjDOqU3/images/app_ui/Menu_No_views.jpg?w=1100&fit=max&auto=format&n=4kbs1cW6PdjDOqU3&q=85&s=7ee0771a9d10880e774d04deff43ed01)
 
----
 
-## 評価体系の充実
+### 次の実験を自動で決めて実行する: W&B Skills
 
-Physical AI の開発において、評価は学習と同等以上に重要です。モデルの改善を定量的に追跡し、シミュレーション結果を定性的に確認できる体制がなければ、実験の良し悪しを正しく判断できません。
+W&B は [Skills](https://wandb.ai/site/skills/) も提供しています。これは coding agent が W&B の実験管理機能を使いやすくするための仕組みで、学習結果や run の比較結果を参照しながら、次に試す条件を検討したり、必要に応じて実験コードの更新まで含めて作業を進めたりできます。
 
-本プロジェクトでは、以下の 2 つの評価ニーズに対応しました。
+たとえば、いくつかの学習が終わった段階で run を見直し、どの条件を次に試すかを agent に考えさせる、といった使い方ができます。これをうまく組み込むと、結果を見ながら次の実験を継続的に改善していくワークフローを作りやすくなります。
 
-- **定量評価**: 評価データセットに対する成功率やスコアを一括で確認
-- **定性評価**: シミュレーションのロールアウト動画を視覚的に確認
-
-### 実装した評価パイプライン
-
-`scripts/eval_aloha_dataset.py` として、ALOHA Sim 環境での自動評価スクリプトを構築しました。
-
-- **評価マニフェスト**に基づき、固定された評価データセット（subsample / full）に対してシミュレーションを実行
-- 各エピソードの **成功/失敗、最大報酬、ステップ数** を記録
-- ロールアウト動画を自動生成し、W&B にロギング
-- 評価結果を **W&B Table**（Leaderboard 行 + Example 詳細行）として保存
-- すべての結果が同時に **`run.summary`** にも反映され、Workspace 上でのフィルタ・比較に利用可能
+今回の実験でも、後半の条件検討では W&B Skills を補助的に使いました。W&B Skillsはまだ新しいツールになります。是非、W&B Skillsを使い、たくさんfeedbackをいただければと思います！
 
 ---
 
-### 評価ベンチマークに対する結果の確認
+## 2. 評価パイプラインの強化
 
-#### Runs Table による確認
+Physical AI ではシミュレーションの確認がとても重要です。成功率や報酬のような定量指標だけでは、ロボットが実際にどう動いたのか、どこで不安定だったのか、どのように失敗したのかまでは分かりません。そのため、評価ではシミュレーションを可視化して挙動を確かめることが欠かせません。
 
-W&B の Runs Table を使えば、すべての run の summary メトリクス（`eval_full/success_rate`、`eval_full/primary_score` など）を一覧で確認できます。カラムのソートやフィルタにより、最も性能の高い run を素早く特定できます。
+つまり、Physical AI の評価では次の 2 つがどちらも重要です。
 
-#### W&B Table を活用した Leaderboard
+- 定量評価: 成功率、最大報酬、ステップ数など、run 間で比較しやすい指標
+- 定性評価: シミュレーションのロールアウト動画を見て、動き方や失敗パターンを確認すること
 
-W&B Table を利用することで、より構造化された比較が可能になります。
 
-**仕組み:**
-- 各評価 run が **1 行の Leaderboard 行**（`eval_full/leaderboard`）を W&B Table として保存
-- Workspace 上で複数の run の Table パネルを表示すると、各 run の結果が自動的に集約され、実験横断の比較テーブルが構成される
+### 定量評価: W&B Table で leaderboard を作る
 
-Leaderboard の各行には以下の情報が含まれます:
+今回追加した `scripts/eval_aloha_dataset.py` は、評価結果を JSON / CSV に保存するだけでなく、W&B Table としても記録します。W&B Table は、列構造を持ったデータをそのまま UI 上で扱える仕組みです。
 
-- `eval_name` — 評価名
-- `config_name` — 使用した設定名
-- `checkpoint_step` — チェックポイントのステップ数
-- `primary_score` — 主要スコア。Transfer Cube では成功率と同義
-- `success_rate` — 成功率
-- `mean_max_reward` — 平均最大報酬
-- `num_examples` — 評価したエピソード数
+今回の工夫は 2 つあります。1 つ目は、checkpoint ごとの評価結果を俯瞰できる leaderboard を用意したことです。これにより、複数 run を Workspace 上で並べたときに、どの checkpoint が良かったかを比較しやすくなります。
 
----
+2 つ目は、集約結果だけで終わらせず、サンプルごとの個別評価も残せるようにしたことです。これにより、「全体スコアは近いが、どのサンプルで差が出ているか」「どの episode で失敗したか」といった点まで追えるようになります。
 
-### シミュレーション動画の可視化
+Table にどの情報を持たせているかの詳細は `scripts/eval_aloha_dataset.py` と `src/openpi/utils/wandb/leaderboard.py` に実装しています。主要な評価値は `run.summary` にも反映しているため、Table を開かなくても Workspace 上の filter や sort に使えます。
 
-IsaacSim を使用する場合はシミュレーション結果の可視化がネイティブにサポートされていますが、OpenPI のコードベースにはその機能がありませんでした。本プロジェクトでは、ALOHA Sim のロールアウト動画を W&B に自動ロギングする仕組みを追加しました。
+<!-- ここに OpenPI の leaderboard table のスクリーンショットを挿入 -->
 
-実装の詳細は、[GitHub リポジトリの `scripts/eval_aloha_dataset.py`](https://github.com/olachinkei/openpi) と `src/openpi/utils/wandb/videos.py` を参照してください。
+### 定性評価: ロールアウト動画を W&B Media Panel で見る
 
-<!-- ここに実際の OpenPI ロールアウト動画のスクリーンショットまたは W&B Panel を挿入 -->
+今回の integration では、ALOHA Sim の rollout を `wandb.Video` として記録し、W&B Media Panel で step ごとに見られるようにしました。評価サンプルごとのロールアウト動画を残しているので、各 checkpoint でロボットがどう動いたかを後から追えます。
 
-#### Media Panel の活用
+これにより、学習が進むにつれてロボットが本当にタスクを達成できるようになっているのか、あるいは途中で不安定さが残っていないかを、動画を見ながら確認できるようになりました。数値だけでは見えにくい改善や失敗の仕方を、step ごとのシミュレーション動画として追えるようにしたことがポイントです。
 
-W&B の Media Panel には、動画・画像の評価を効率化する多くの機能があります。以下に、Physical AI の評価ワークフローに特に有用な機能を紹介します。
 
-詳細: https://docs.wandb.ai/models/app/features/panels/media#media-panels
+実装の詳細は、`scripts/eval_aloha_dataset.py`、`src/openpi/training/aloha_eval.py`、`src/openpi/utils/wandb/videos.py` を参照してください。
 
----
+<!-- ここに OpenPI ロールアウト動画のスクリーンショット、または W&B Media Panel のキャプチャを挿入 -->
 
-#### Synchronized Video Playback（動画の同期再生）
+### Media Panel で特に便利な機能
 
-マルチモーダルモデルの評価では、定性的な確認が不可欠です。Synchronized Video Playback を使うと、複数の動画を同期して再生・一時停止・スクラブ・速度調整でき、視覚的な差異を即座に把握できます。
+[Media Panels の詳細](https://docs.wandb.ai/models/app/features/panels/media#media-panels) にもある通り、W&B の Media Panel は 2025 年にも機能拡充が進みました。Physical AI への注目が高まる中で、シミュレーションやロールアウト動画を扱いやすくするための改善も進んでいます。
 
-**主な利点:**
-- **正確な比較**: 一度スクラブすれば全動画が追従。時間的な一貫性やモーションのアーティファクトを検出しやすい
-- **Workspace 全体での同期**: Workspace、Section、または Panel レベルで一度設定すれば、すべての Media Panel の動画が同期
-- **自動再生 & ループ**: 動画の自動再生やループ再生を設定可能
+ここでは、その中でも Physical AI の文脈で特に便利な Media Panel の機能を紹介します。
 
-**Physical AI での活用例:**
-- 異なる学習 run 間でのロールアウト動画の比較
-- スタイル・タイミング・動作の品質確認（Visual QA）
-- 回帰・修正のフレーム単位での確認
+#### Synchronized Video Playback
 
-設定方法: Settings → Media → Sync で「Sync video playback」を有効化
+複数動画を同期再生できる機能です。ある checkpoint の成功例と失敗例、あるいは JAX run と PyTorch run の同じ prompt を並べて見るときに便利です。一度スクラブすると全動画が同じ時刻にそろうので、把持タイミングや受け渡し動作の違いをフレーム単位で比較できます。
 
 デモ動画: https://www.loom.com/share/244cb3be1de04ad8a4ee22654d730b0f
 
----
+#### Synced Media Sliders
 
-#### Synced Media Sliders（メディアスライダーの同期）
-
-複数パネル間でメディアスライダーを同期してステップ実行でき、関連する画像群を効率的に比較できます。Section 単位または Workspace 全体で同期を設定可能です。
+複数 panel のメディアスライダーを同期できる機能です。動画だけでなく、関連画像や派生メディアを同じ step で見比べたいときに役立ちます。
 
 デモ動画: https://app.getbeamer.com/pictures?id=519192-Ge-_vXnesu-_vTUj77-977-977-977-9Pu-_vVtqbXDWhu-_vX0X77-91r7vv70uRzRd77-9&v=4
 
----
-
 #### Media Panel の一括制御
 
-ライングラフと同様に、Media Panel の設定を Workspace 全体または Section 単位で一括管理できます。
-
-- Epoch ごとの表示やカスタムグリッドパターンへの配置を、パネルごとに個別設定する必要なく一括で適用
-- 必要に応じて個別パネルのオーバーライドも可能
-
-設定時間を削減し、分析により多くの時間を割くことができます。
+Workspace 全体や Section 単位で panel 設定をそろえる機能です。動画 panel が増えるほど、個別設定の手間は無視できません。一括制御を使うと、表示方式やグリッド設定をまとめて揃えられるため、分析に集中しやすくなります。
 
 デモ動画: https://app.getbeamer.com/pictures?id=504954-Y17vv73vv73vv73vv71_Ie-_vUI1zZg4PO-_ve-_vWHvv73vv70oC--_ve-_ve-_ve-_vXta3ZZz&v=4
 
 ---
 
-## アセット管理
+## 3. アセット管理
 
-### Artifacts: 学習中のアセットのバージョン管理
+### なぜアセット管理が重要なのか
 
-W&B Artifacts は、データセット・モデルチェックポイント・評価結果などの成果物をバージョン管理し、実験間のリネージ（系譜）を追跡するための仕組みです。
+Physical AI では、あとから「どのデータで学習し、どの checkpoint を評価し、その結果として何が得られたか」を辿れることが重要です。特に checkpoint が増えてくると、ローカルのファイル名だけで管理するのはすぐに難しくなります。
 
-**主な価値:**
-- **バージョン管理**: すべてのアーティファクトに自動的にバージョン番号が付与され、任意の過去バージョンに遡れる
-- **リネージ追跡**: どの run がどのデータセットを使い、どのチェックポイントを生成したかの依存関係を自動的に記録
-- **エイリアス**: `latest`、`best-eval`、`final` などのエイリアスを設定し、意味のあるラベルで参照可能
-- **ストレージ効率**: 変更がないファイルは重複保存されず、差分のみが記録される
+そこで今回の integration では、checkpoint のバージョン管理と、データからモデル、評価結果までのリネージを保つことを重視しました。
 
-![Artifacts ページ](https://mintcdn.com/wb-21fd5541/wKCrMJZKG3PxyJhv/images/artifacts/artifacts_landing_page2.png?w=2500&fit=max&auto=format&n=wKCrMJZKG3PxyJhv&q=85&s=3f9dfc871cf363d168542c779d61a6c6)
+### Artifacts: checkpoint のバージョン管理を強化する
 
-#### 本プロジェクトでの実装
+W&B Artifacts は、実験の中で大量に発生するcheckpointや結果ファイルをバージョン付きで管理するための仕組みです。今回特に強化したのは、学習で出てくるモデル checkpoint の扱いです。
 
-`src/openpi/utils/wandb/artifacts.py` に `WandbArtifactManager` を実装し、以下のアーティファクトを管理しています。
+`pi0_aloha_sim` では 5,000 step ごとのマイルストーンと final を公開しており、`step-5000`、`step-10000`、`step-15000`、`final` のような alias で辿れます。これにより、保存コストを抑えつつ、学習の進み方を checkpoint 単位で比較しやすくしています。ここのパラメータは容易に変更できるようになっています。
 
-- **`model-checkpoint`** — 学習中のマイルストーンチェックポイント（`step-N`、`latest`、`final` エイリアス付き）
-- **`dataset-manifest`** — 評価データセットのマニフェスト（subsample / full）
-- **`eval-results`** — 評価結果（メトリクス + 詳細テーブル）
-- **`eval-video-bundle`** — 評価ロールアウト動画のバンドル
+あわせて、lineage機能を使い、各 checkpoint が、どのデータセットとパラメータを利用して作られたのかを追いやすくし、モデルのバージョン管理が単なる保存ではなく、後から比較と検証に使える形になるようにしました。
 
-チェックポイントの公開ポリシーとして、すべてのステップを保存するのではなく、マイルストーンステップ（設定した間隔）と最終ステップのみを W&B に公開することで、ストレージコストを抑えています。
 
----
 
-### Registry: 組織横断のアセット共有と検索
+### Registry: データとモデルのリネージを保つ
 
-W&B Registry は、Artifacts の上位レイヤーとして、組織全体でモデルやデータセットを共有・検索・管理するための集中型カタログです。
+W&B Registry は、チームで使う dataset や model を参照しやすく保つための仕組みです。今回の連携では、まず学習用 dataset と評価用 dataset を Registry に載せ、それを参照して学習と評価を行う形にしました。Artifacts が実験中に出てくる大量のアセットを管理するための仕組みであるのに対して、Registry はチームで共有したい重要なアセットを参照しやすく保つための仕組みです。
 
-**主な価値:**
-- **集中管理**: 組織内のすべてのモデル・データセットを一元的に管理し、検索可能にする
-- **ガバナンス**: アクセス制御やバージョン管理のポリシーを組織レベルで適用
-- **Automation との連携**: Registry にリンクされたアーティファクトのバージョン変更をトリガーとして、デプロイやテストの自動化が可能
-- **カスタムコレクション**: チーム固有の分類やタグ付けで、目的に応じたコレクションを作成
+学習データセットや評価データセットをRegistryに登録し、そのデータを利用することで学習と評価を開始するようにしています。
+
+今回参照している artifact ref の例は次の 3 つです。
+
+- train: `wandb32/wandb-registry-Physical AI - openpi/training dataset:v0`
+- eval: `wandb32/wandb-registry-Physical AI - openpi/evaluation dataset for openpi:v0`
+- holdout (`eval_final`): `wandb32/wandb-registry-Physical AI - openpi/evaluation dataset for openpi:v1`
+
+実際には、今回の実装では次のように `use_artifact` で train / eval / holdout (`eval_final`) の artifact を参照しています。train は学習に使った dataset version を記録するために参照し、eval と holdout は manifest を解決して実際の評価に使っています。
+
+```python
+dataset_artifact_refs = _dataset_artifacts.configured_dataset_artifact_refs(config)
+if train_ref := dataset_artifact_refs.get("train"):
+    wandb.run.use_artifact(train_ref)
+
+if eval_ref := dataset_artifact_refs.get("eval"):
+    wandb.run.use_artifact(eval_ref)
+    resolved_eval_manifest = _download_artifact_payload(eval_ref, artifact_root / "eval")
+    if resolved_eval_manifest is not None:
+        config = dataclasses.replace(config, eval_manifest_path=str(resolved_eval_manifest))
+
+if holdout_ref := dataset_artifact_refs.get("eval_final"):
+    wandb.run.use_artifact(holdout_ref)
+    resolved_holdout_manifest = _download_artifact_payload(holdout_ref, artifact_root / "eval_final")
+    if resolved_holdout_manifest is not None:
+        config = dataclasses.replace(config, final_eval_manifest_path=str(resolved_holdout_manifest))
+```
+
+
+run ごとに同じ dataset を再 upload しなくてよいので、運用も整理しやすくなりますし、後からモデルを見直すときにも前提条件を追いやすくなります。
 
 ![Registry ページ](https://mintcdn.com/wb-21fd5541/AXlwJe6YUBax3n2I/images/registry/registry_landing_page.png?w=2500&fit=max&auto=format&n=AXlwJe6YUBax3n2I&q=85&s=88562e36bd19c3d5a7e492a6cabb604c)
-
-Physical AI の開発では、多数のチェックポイントが生成されます。Registry を活用することで、優れた性能を示したモデルをチーム内で共有し、本番デプロイや追加学習のベースとして再利用する体制を構築できます。
 
 ---
 
 ## おわりに
 
-本レポートでは、OpenPI に対して実装した W&B 統合の全体像を紹介しました。
+今回の OpenPI x W&B integration では、1 本の run から、使った設定、checkpoint ごとの評価結果、ロールアウト動画、そして学習・評価データとのつながりまで追える状態を目指しました。
 
-- **学習フェーズ**: 構造化された Config とメタデータにより、複数実験の効率的な比較を実現
-- **評価フェーズ**: 自動評価パイプラインと W&B Table による Leaderboard で、定量・定性の両面から評価
-- **アセット管理**: Artifacts と Registry によるチェックポイント・データセットの体系的な管理
+また、Physical AI では、loss や成功率だけでは十分ではありません。シミュレーションの結果をわかりやすく可視化することで、パフォーマンスをより深く理解することができるようにしました。
 
-これらの統合により、Physical AI の開発ワークフロー全体を通じて、実験の再現性・追跡可能性・チーム内共有を向上させることができます。
-
-実装の詳細やコードは [GitHub リポジトリ](https://github.com/olachinkei/openpi) を、Physical AI ワークフローにおける W&B の一般的な活用デモは [YouTube 動画](https://www.youtube.com/watch?v=45Beo0ZkJJA) をご確認ください。
+今回の integration や本レポートで紹介した機能が、Physical AI の実験基盤を整えるときの参考になればと思います。

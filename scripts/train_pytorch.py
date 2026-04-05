@@ -24,13 +24,16 @@ Multi-Node Training:
 """
 
 import dataclasses
+import datetime
 import gc
+import json
 import logging
 import os
 import pathlib
 import platform
 import shutil
 import time
+import traceback
 
 import jax
 import numpy as np
@@ -43,14 +46,28 @@ import wandb
 
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
+import openpi.policies.policy_config as _policy_config
 import openpi.shared.normalize as _normalize
+import openpi.training.aloha_eval as _aloha_eval
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
 import openpi.training.dataset_artifacts as _dataset_artifacts
+import openpi.training.eval_manifest as _eval_manifest
 import openpi.training.eval_submission as _eval_submission
 import openpi.training.eval_tracking as _eval_tracking
 import openpi.utils.wandb.artifacts as _wandb_artifacts
+import openpi.utils.wandb.leaderboard as _wandb_leaderboard
 import openpi.utils.wandb.run_context as _wandb_run_context
+import openpi.utils.wandb.tables as _wandb_tables
+import openpi.utils.wandb.types as _wandb_types
+import openpi.utils.wandb.videos as _wandb_videos
+
+
+@dataclasses.dataclass(frozen=True)
+class PendingEvalResult:
+    split_name: str
+    results_path: pathlib.Path
+    history_step: int | None = None
 
 
 def init_logging():
@@ -75,38 +92,141 @@ def init_logging():
         logger.handlers[0].setFormatter(formatter)
 
 
-def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
+def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
     """Initialize wandb logging."""
+    log_code_root = pathlib.Path(__file__).resolve().parent.parent if log_code else None
     return _wandb_run_context.WandbRunContext.init_for_training(
         config,
         backend="pytorch",
         resuming=resuming,
         enabled=enabled,
-        log_code_root=pathlib.Path(__file__).resolve().parent.parent,
+        log_code_root=log_code_root,
     )
+
+
+def _configure_eval_metric_axes(config: _config.TrainConfig) -> None:
+    for split_name in {config.eval_split_name, config.final_eval_split_name}:
+        metric_prefix = _eval_tracking.metric_namespace_for_split(split_name)
+        checkpoint_metric = f"{metric_prefix}/checkpoint_step"
+        wandb.define_metric(checkpoint_metric)
+        for metric_name in ("primary_score", "success_rate", "mean_max_reward", "num_examples"):
+            wandb.define_metric(f"{metric_prefix}/{metric_name}", step_metric=checkpoint_metric)
+
+
+def _results_import_marker(results_path: pathlib.Path) -> pathlib.Path:
+    return results_path.with_name(f".{results_path.stem}.imported_to_train")
+
+
+def _import_eval_results_to_train_run(
+    wandb_run: _wandb_run_context.WandbRunContext,
+    *,
+    split_name: str,
+    results_path: pathlib.Path,
+    history_step: int | None = None,
+) -> bool:
+    marker_path = _results_import_marker(results_path)
+    if marker_path.exists() or not results_path.exists():
+        return False
+
+    payload = json.loads(results_path.read_text())
+    metric_prefix = _eval_tracking.metric_namespace_for_split(split_name)
+    metrics = payload.get("metrics", {})
+    checkpoint_step = metrics.get("checkpoint_step")
+
+    if metrics:
+        wandb_run.log_metrics(metrics, step=history_step, prefix=metric_prefix)
+        wandb_run.log_summary({f"{metric_prefix}/{key}": value for key, value in metrics.items() if value is not None})
+
+    video_records = []
+    for result in payload.get("results", []):
+        video_path = result.get("video_path")
+        if not video_path:
+            continue
+        example_id = result.get("example_id", pathlib.Path(video_path).stem)
+        success = int(bool(result.get("success", False)))
+        reward = float(result.get("max_reward", 0.0))
+        video_records.append(
+            _wandb_types.VideoRecord(
+                path=video_path,
+                name=example_id,
+                caption=f"step={checkpoint_step} | {example_id} | success={success} | reward={reward:.2f}",
+            )
+        )
+    if video_records:
+        _wandb_videos.VideoLogger().log_video_files(
+            f"{metric_prefix}/videos",
+            video_records,
+            step=history_step,
+        )
+
+    marker_path.write_text(json.dumps({"imported_at": int(time.time()), "split_name": split_name}))
+    logging.info("Imported %s results into train run from %s", split_name, results_path)
+    return True
+
+
+def _flush_available_eval_results(
+    wandb_run: _wandb_run_context.WandbRunContext,
+    pending_eval_results: list[PendingEvalResult],
+) -> list[PendingEvalResult]:
+    remaining = []
+    for pending_result in pending_eval_results:
+        if not _import_eval_results_to_train_run(
+            wandb_run,
+            split_name=pending_result.split_name,
+            results_path=pending_result.results_path,
+            history_step=pending_result.history_step,
+        ):
+            remaining.append(pending_result)
+    return remaining
+
+
+def _wait_for_eval_results(
+    wandb_run: _wandb_run_context.WandbRunContext,
+    pending_eval_results: list[PendingEvalResult],
+    *,
+    poll_interval_secs: int,
+) -> list[PendingEvalResult]:
+    remaining = pending_eval_results
+    while remaining:
+        remaining = _flush_available_eval_results(wandb_run, remaining)
+        if remaining:
+            time.sleep(poll_interval_secs)
+    return remaining
 
 
 def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
-    if use_ddp and not torch.distributed.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
-
-        # Set up debugging environment variables for DDP issues
-        if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
-            os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
-
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         torch.cuda.set_device(device)
+
+    if use_ddp and not torch.distributed.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        timeout_secs = int(os.environ.get("TORCH_DISTRIBUTED_TIMEOUT_SECS", "7200"))
+        init_kwargs = {
+            "backend": backend,
+            "init_method": "env://",
+            "timeout": datetime.timedelta(seconds=timeout_secs),
+        }
+        if backend == "nccl" and device.type == "cuda":
+            init_kwargs["device_id"] = device
+        torch.distributed.init_process_group(**init_kwargs)
+
+        # Set up debugging environment variables for DDP issues.
+        if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
+            os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
+
     return use_ddp, local_rank, device
 
 
-def cleanup_ddp():
+def cleanup_ddp(device: torch.device | None = None):
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        if device is not None and device.type == "cuda":
+            torch.distributed.barrier(device_ids=[device.index])
+        else:
+            torch.distributed.barrier()
         torch.distributed.destroy_process_group()
 
 
@@ -141,6 +261,110 @@ def get_model_parameters(model):
     )
 
 
+def get_unwrapped_model(model):
+    """Get the underlying model, removing any DDP wrapper."""
+    return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+
+
+def _ddp_barrier(use_ddp: bool, device: torch.device | None = None) -> None:
+    if use_ddp and dist.is_initialized():
+        if device is not None and device.type == "cuda":
+            dist.barrier(device_ids=[device.index])
+        else:
+            dist.barrier()
+
+
+def _main_rank_sync_marker(config: _config.TrainConfig, *, step: int, phase: str) -> pathlib.Path:
+    return pathlib.Path(config.checkpoint_dir) / f".sync-{phase}-{step}.json"
+
+
+def _write_main_rank_sync_marker(
+    marker_path: pathlib.Path,
+    *,
+    ok: bool,
+    phase: str,
+    step: int,
+    error: str | None = None,
+    traceback_text: str | None = None,
+) -> None:
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "ok": ok,
+        "phase": phase,
+        "step": step,
+        "timestamp": time.time(),
+    }
+    if error is not None:
+        payload["error"] = error
+    if traceback_text is not None:
+        payload["traceback"] = traceback_text
+    marker_path.write_text(json.dumps(payload))
+
+
+def _wait_for_main_rank_sync_marker(
+    marker_path: pathlib.Path,
+    *,
+    phase: str,
+    step: int,
+    poll_interval_secs: int,
+    timeout_secs: int = 4 * 60 * 60,
+) -> None:
+    deadline = time.time() + timeout_secs
+    while not marker_path.exists():
+        if time.time() > deadline:
+            raise TimeoutError(f"Timed out waiting for main-rank {phase} completion at step {step}: {marker_path}")
+        time.sleep(poll_interval_secs)
+
+    payload = json.loads(marker_path.read_text())
+    if not payload.get("ok", False):
+        error_message = payload.get("error", f"Main-rank {phase} failed at step {step}")
+        traceback_text = payload.get("traceback")
+        if traceback_text:
+            raise RuntimeError(f"{error_message}\n{traceback_text}")
+        raise RuntimeError(error_message)
+
+
+def _run_main_rank_only_phase(
+    *,
+    config: _config.TrainConfig,
+    use_ddp: bool,
+    is_main: bool,
+    step: int,
+    phase: str,
+    action,
+) -> None:
+    marker_path = _main_rank_sync_marker(config, step=step, phase=phase)
+    if is_main and marker_path.exists():
+        marker_path.unlink()
+
+    if not use_ddp:
+        action()
+        return
+
+    if is_main:
+        try:
+            action()
+        except Exception as exc:
+            _write_main_rank_sync_marker(
+                marker_path,
+                ok=False,
+                phase=phase,
+                step=step,
+                error=f"{type(exc).__name__}: {exc}",
+                traceback_text=traceback.format_exc(),
+            )
+            raise
+        else:
+            _write_main_rank_sync_marker(marker_path, ok=True, phase=phase, step=step)
+    else:
+        _wait_for_main_rank_sync_marker(
+            marker_path,
+            phase=phase,
+            step=step,
+            poll_interval_secs=config.eval_results_poll_interval_secs,
+        )
+
+
 def save_checkpoint(
     model,
     optimizer,
@@ -151,13 +375,10 @@ def save_checkpoint(
     artifact_manager=None,
     wandb_run=None,
     dataset_artifact_refs=None,
-    periodic_eval_dependency_job_id=None,
 ):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
-        return periodic_eval_dependency_job_id
-
-    next_periodic_eval_dependency_job_id = periodic_eval_dependency_job_id
+        return False
 
     # Only save if it's time to save or if it's the final step
     if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps:
@@ -197,26 +418,9 @@ def save_checkpoint(
 
         logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
-        # Log checkpoint to wandb
-        if config.wandb_enabled and wandb.run is not None:
-            wandb.log({"train/checkpoint_step": global_step}, step=global_step)
-            wandb.run.summary["train/checkpoint_step"] = global_step
-
-        job_id = _eval_submission.maybe_submit_periodic_eval(
-            config,
-            checkpoint_step=global_step,
-            dependency_job_id=periodic_eval_dependency_job_id,
-        )
-        if job_id is not None:
-            next_periodic_eval_dependency_job_id = job_id
-            if wandb_run is not None:
-                eval_prefix = _eval_tracking.metric_namespace_for_split(config.eval_split_name)
-                wandb_run.log_summary(
-                    {
-                        f"{eval_prefix}/last_submitted_job_id": job_id,
-                        f"{eval_prefix}/last_submitted_checkpoint_step": global_step,
-                    }
-                )
+        if wandb_run is not None:
+            wandb_run.log_metrics({"checkpoint_step": global_step}, step=global_step, prefix="train")
+            wandb_run.log_summary({"train/checkpoint_step": global_step})
 
         if config.wandb_enabled and wandb.run is not None:
             if artifact_manager is not None and _wandb_artifacts.should_publish_checkpoint_artifact(
@@ -244,8 +448,232 @@ def save_checkpoint(
                         else dataset_artifact_refs.get("eval_final"),
                     },
                 )
+        return True
 
-    return next_periodic_eval_dependency_job_id
+    return False
+
+
+def _run_local_eval_and_resume_training(
+    config: _config.TrainConfig,
+    wandb_run: _wandb_run_context.WandbRunContext,
+    artifact_manager: _wandb_artifacts.WandbArtifactManager,
+    *,
+    model,
+    checkpoint_step: int,
+    split_name: str,
+    num_examples: int | None,
+    data_config,
+    device: torch.device,
+) -> None:
+    logging.info("Running inline local %s eval at step %s on the current allocation.", split_name, checkpoint_step)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    _run_inline_aloha_eval(
+        config,
+        wandb_run,
+        artifact_manager,
+        model=model,
+        checkpoint_step=checkpoint_step,
+        split_name=split_name,
+        num_examples=num_examples,
+        history_step=checkpoint_step,
+        data_config=data_config,
+        device=device,
+    )
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+
+def _run_local_final_eval(
+    config: _config.TrainConfig,
+    wandb_run: _wandb_run_context.WandbRunContext,
+    artifact_manager: _wandb_artifacts.WandbArtifactManager,
+    *,
+    model,
+    checkpoint_step: int,
+    data_config,
+    device: torch.device,
+) -> None:
+    logging.info("Running inline local final eval at step %s on the current allocation.", checkpoint_step)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    _run_inline_aloha_eval(
+        config,
+        wandb_run,
+        artifact_manager,
+        model=model,
+        checkpoint_step=checkpoint_step,
+        split_name=config.final_eval_split_name,
+        num_examples=config.final_eval_num_examples,
+        history_step=checkpoint_step,
+        data_config=data_config,
+        device=device,
+    )
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+
+def _run_inline_aloha_eval(
+    config: _config.TrainConfig,
+    wandb_run: _wandb_run_context.WandbRunContext,
+    artifact_manager: _wandb_artifacts.WandbArtifactManager,
+    *,
+    model,
+    checkpoint_step: int,
+    split_name: str,
+    num_examples: int | None,
+    history_step: int,
+    data_config,
+    device: torch.device,
+) -> None:
+    manifest_path_str = config.eval_manifest_path if split_name == config.eval_split_name else config.final_eval_manifest_path
+    manifest_path = _eval_manifest.resolve_repo_path(manifest_path_str)
+    if manifest_path is None or not manifest_path.exists():
+        raise FileNotFoundError(f"Manifest path for {split_name} eval does not exist: {manifest_path_str}")
+
+    metric_prefix = _eval_tracking.metric_namespace_for_split(split_name)
+    checkpoint_alias = f"step-{checkpoint_step}"
+    checkpoint_dir = pathlib.Path(config.checkpoint_dir) / str(checkpoint_step)
+    video_root, results_path = _eval_submission.build_eval_output_paths(
+        config,
+        checkpoint_step=checkpoint_step,
+        split_name=split_name,
+    )
+    video_root.mkdir(parents=True, exist_ok=True)
+
+    artifact_stem = f"{_aloha_eval.slugify(config.name)}-{_aloha_eval.slugify(config.exp_name)}"
+    results_artifact_name = f"{artifact_stem}-{metric_prefix}-results"
+    media_artifact_name = f"{artifact_stem}-{metric_prefix}-videos"
+    artifact_aliases = tuple(alias for alias in (checkpoint_alias, split_name, "latest") if alias)
+    results_artifact_ref = _wandb_artifacts.build_artifact_ref(results_artifact_name, (checkpoint_alias,))
+    media_artifact_ref = _wandb_artifacts.build_artifact_ref(media_artifact_name, (checkpoint_alias,))
+
+    manifest = _aloha_eval.load_manifest(manifest_path)
+    model_to_eval = get_unwrapped_model(model)
+    was_training = model_to_eval.training
+    model_to_eval.eval()
+    try:
+        policy = _policy_config.create_policy_from_model(
+            config,
+            model_to_eval,
+            default_prompt=manifest.prompt,
+            norm_stats=data_config.norm_stats,
+            pytorch_device=str(device),
+            is_pytorch=True,
+        )
+        bundle = _aloha_eval.evaluate_policy(
+            policy=policy,
+            manifest=manifest,
+            split_name=split_name,
+            checkpoint_step=checkpoint_step,
+            num_examples=0 if num_examples is None else num_examples,
+            video_dir=video_root,
+            media_artifact_ref=media_artifact_ref,
+            task=os.environ.get("EVAL_TASK", _aloha_eval.DEFAULT_TASK),
+            action_horizon=int(os.environ.get("ACTION_HORIZON", "10")),
+            max_episode_steps=int(os.environ.get("MAX_EPISODE_STEPS", "0")),
+            success_reward_threshold=float(os.environ.get("SUCCESS_REWARD_THRESHOLD", "4.0")),
+            fps=int(os.environ.get("EVAL_FPS", "50")),
+            render_mode=os.environ.get("RENDER_MODE"),
+            visualization_width=int(os.environ.get("VISUALIZATION_WIDTH", "640")),
+            visualization_height=int(os.environ.get("VISUALIZATION_HEIGHT", "336")),
+            visualization_camera_id=os.environ.get("VISUALIZATION_CAMERA_ID", "angle"),
+        )
+    finally:
+        if was_training:
+            model_to_eval.train()
+
+    _aloha_eval.write_results(
+        results_path,
+        config_name=config.name,
+        checkpoint_dir=str(checkpoint_dir),
+        checkpoint_step=checkpoint_step,
+        checkpoint_alias=checkpoint_alias,
+        manifest_path=manifest_path,
+        split_name=split_name,
+        metrics=bundle.metrics,
+        results=bundle.results,
+    )
+
+    wandb_run.log_metrics(bundle.metrics, step=history_step, prefix=metric_prefix)
+    wandb_run.log_summary({f"{metric_prefix}/{key}": value for key, value in bundle.metrics.items() if value is not None})
+    wandb_run.log_summary(
+        {
+            f"{metric_prefix}/split_name": split_name,
+            f"{metric_prefix}/checkpoint_alias": checkpoint_alias,
+            f"{metric_prefix}/source_train_run_id": wandb.run.id if wandb.run is not None else None,
+            f"{metric_prefix}/source_train_run_name": config.exp_name,
+        }
+    )
+    _wandb_videos.VideoLogger().log_video_files(f"{metric_prefix}/videos", bundle.video_records, step=history_step)
+    _wandb_tables.WandbTableLogger(key=f"{metric_prefix}/examples", columns=_aloha_eval.EXAMPLE_COLUMNS).log_immutable(
+        bundle.example_rows,
+        step=history_step,
+    )
+    _wandb_leaderboard.LeaderboardTableLogger(key=f"{metric_prefix}/leaderboard").log_row(
+        _wandb_types.LeaderboardRow(
+            eval_run_id=wandb.run.id if wandb.run is not None else config.exp_name,
+            source_train_run_id=wandb.run.id if wandb.run is not None else None,
+            source_train_run_name=config.exp_name,
+            eval_name=manifest.name,
+            eval_split=split_name,
+            model_family=getattr(config.model, "model_type", type(config.model).__name__),
+            config_name=config.name,
+            task_name=manifest.task_name,
+            dataset_name=manifest.dataset_name,
+            checkpoint_alias=checkpoint_alias,
+            checkpoint_step=checkpoint_step,
+            primary_score=bundle.metrics["primary_score"],
+            success_rate=bundle.metrics["success_rate"],
+            mean_max_reward=bundle.metrics["mean_max_reward"],
+            num_examples=bundle.metrics["num_examples"],
+            artifact_ref_results=results_artifact_ref,
+            artifact_ref_media=media_artifact_ref,
+            notes=f"success_reward_threshold={os.environ.get('SUCCESS_REWARD_THRESHOLD', '4.0')}",
+        ),
+        step=history_step,
+    )
+    artifact_metadata = {
+        "config_name": config.name,
+        "task_name": manifest.task_name,
+        "dataset_name": manifest.dataset_name,
+        "split_name": split_name,
+        "checkpoint_step": checkpoint_step,
+        "checkpoint_alias": checkpoint_alias,
+        "source_train_run_id": wandb.run.id if wandb.run is not None else None,
+        "source_train_run_name": config.exp_name,
+    }
+    artifact_manager.log_artifact(
+        _wandb_types.ArtifactRecord(
+            name=results_artifact_name,
+            type="eval-results",
+            path=str(results_path),
+            aliases=artifact_aliases,
+            description=f"ALOHA Sim {split_name} evaluation results",
+            metadata=artifact_metadata,
+        )
+    )
+    artifact_manager.log_artifact(
+        _wandb_types.ArtifactRecord(
+            name=media_artifact_name,
+            type="eval-video-bundle",
+            path=str(video_root),
+            aliases=artifact_aliases,
+            description=f"ALOHA Sim {split_name} evaluation videos",
+            metadata=artifact_metadata,
+        )
+    )
+    wandb_run.log_summary(
+        {
+            f"{metric_prefix}/results_artifact": results_artifact_ref,
+            f"{metric_prefix}/video_artifact": media_artifact_ref,
+        }
+    )
+    logging.info("Finished inline %s eval at checkpoint step %s.", split_name, checkpoint_step)
 
 
 def load_checkpoint(model, optimizer, checkpoint_dir, device):
@@ -367,9 +795,9 @@ def train_loop(config: _config.TrainConfig):
 
     # Initialize checkpoint directory and wandb
     resuming = False
+    exp_checkpoint_dir = config.checkpoint_dir
     if config.resume:
         # Find checkpoint directory based on experiment name
-        exp_checkpoint_dir = config.checkpoint_dir
         if exp_checkpoint_dir.exists():
             # Use validation to find the latest working checkpoint
             latest_step = get_latest_checkpoint_step(exp_checkpoint_dir)
@@ -383,15 +811,18 @@ def train_loop(config: _config.TrainConfig):
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
     elif config.overwrite and config.checkpoint_dir.exists():
-        shutil.rmtree(config.checkpoint_dir)
-        logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+        if is_main:
+            shutil.rmtree(config.checkpoint_dir)
+            logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+        _ddp_barrier(use_ddp, device)
 
     # Create checkpoint directory with experiment name
     if not resuming:
         # For new runs, create experiment-specific checkpoint directory
-        exp_checkpoint_dir = config.checkpoint_dir
-        exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        if is_main:
+            exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        _ddp_barrier(use_ddp, device)
     else:
         # For resume, checkpoint_dir is already set to the experiment directory
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
@@ -401,19 +832,14 @@ def train_loop(config: _config.TrainConfig):
     artifact_manager = None
     dataset_artifact_refs = {}
     if is_main:
-        dataset_artifact_refs = _dataset_artifacts.publish_dataset_artifacts(
-            config,
-            backend="pytorch",
-            enabled=config.wandb_enabled,
-        )
         wandb_run = init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+        if config.wandb_enabled:
+            _configure_eval_metric_axes(config)
         artifact_manager = _wandb_artifacts.WandbArtifactManager()
+        dataset_artifact_refs = _dataset_artifacts.configured_dataset_artifact_refs(config)
         if dataset_artifact_refs:
-            if wandb.run is not None:
-                for artifact_ref in dataset_artifact_refs.values():
-                    if artifact_ref:
-                        wandb.run.use_artifact(artifact_ref)
-        else:
+            config, dataset_artifact_refs = _dataset_artifacts.bind_dataset_artifact_payloads(config, dataset_artifact_refs)
+        elif config.publish_dataset_artifacts:
             dataset_artifact_refs = _dataset_artifacts.register_dataset_artifacts(config, artifact_manager)
         if wandb_run is not None:
             wandb_run.log_summary(
@@ -423,6 +849,13 @@ def train_loop(config: _config.TrainConfig):
                     "data/eval_final_dataset_artifact": dataset_artifact_refs.get("eval_final"),
                 }
             )
+    if use_ddp:
+        config_holder = [config]
+        refs_holder = [dataset_artifact_refs]
+        dist.broadcast_object_list(config_holder, src=0)
+        dist.broadcast_object_list(refs_holder, src=0)
+        config = config_holder[0]
+        dataset_artifact_refs = refs_holder[0]
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
@@ -476,24 +909,28 @@ def train_loop(config: _config.TrainConfig):
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
 
-    if use_ddp:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
-            gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
-        )
-
-    # Load weights from weight_loader if specified (for fine-tuning)
+    # Load fine-tuning weights before DDP wrapping so every rank starts from the same state.
+    ddp_init_sync = True
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
+        safetensors.torch.load_model(model, model_path)
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+        ddp_init_sync = False
+
+    if use_ddp:
+        logging.info("Wrapping model with DDP on device %s", device)
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            init_sync=ddp_init_sync,
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True,
+            static_graph=False,
+            broadcast_buffers=False,
+        )
+        logging.info("DDP model wrapping complete on device %s", device)
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -554,6 +991,7 @@ def train_loop(config: _config.TrainConfig):
     )
 
     last_eval_job_id = None
+    pending_eval_results: list[PendingEvalResult] = []
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
@@ -648,20 +1086,94 @@ def train_loop(config: _config.TrainConfig):
                 start_time = time.time()
                 infos = []  # Reset stats collection
 
+            if is_main and wandb_run is not None:
+                pending_eval_results = _flush_available_eval_results(wandb_run, pending_eval_results)
+
             global_step += 1
-            # Save checkpoint using the new mechanism
-            last_eval_job_id = save_checkpoint(
-                model,
-                optim,
-                global_step,
-                config,
-                is_main,
-                data_config,
-                artifact_manager,
-                wandb_run,
-                dataset_artifact_refs,
-                last_eval_job_id,
+            should_save_checkpoint = (
+                (global_step % config.save_interval == 0 and global_step > 0)
+                or global_step == config.num_train_steps
             )
+            should_run_periodic_eval = global_step % config.save_interval == 0 and global_step < config.num_train_steps
+
+            if should_save_checkpoint:
+                def _checkpoint_phase() -> None:
+                    nonlocal last_eval_job_id, pending_eval_results
+
+                    checkpoint_saved = save_checkpoint(
+                        model,
+                        optim,
+                        global_step,
+                        config,
+                        True,
+                        data_config,
+                        artifact_manager,
+                        wandb_run,
+                        dataset_artifact_refs,
+                    )
+                    if not checkpoint_saved:
+                        return
+
+                    if config.eval_manifest_path is None or (
+                        config.eval_execution_mode != "local" and config.eval_job_script_path is None
+                    ):
+                        return
+
+                    if config.eval_execution_mode == "local" and should_run_periodic_eval:
+                        if wandb_run is not None and artifact_manager is not None:
+                            _run_local_eval_and_resume_training(
+                                config,
+                                wandb_run,
+                                artifact_manager,
+                                model=model,
+                                checkpoint_step=global_step,
+                                split_name=config.eval_split_name,
+                                num_examples=config.periodic_eval_num_examples,
+                                data_config=data_config,
+                                device=device,
+                            )
+                    elif should_run_periodic_eval and wandb_run is not None:
+                        submitted_job_id = _eval_submission.maybe_submit_periodic_eval(
+                            config,
+                            checkpoint_step=global_step,
+                            dependency_job_id=last_eval_job_id,
+                        )
+                        if submitted_job_id is not None:
+                            eval_prefix = _eval_tracking.metric_namespace_for_split(config.eval_split_name)
+                            wandb_run.log_summary(
+                                {
+                                    f"{eval_prefix}/last_submitted_job_id": submitted_job_id,
+                                    f"{eval_prefix}/last_submitted_checkpoint_step": global_step,
+                                }
+                            )
+                            _, results_path = _eval_submission.build_eval_output_paths(
+                                config,
+                                checkpoint_step=global_step,
+                                split_name=config.eval_split_name,
+                            )
+                            pending_eval_results.append(
+                                PendingEvalResult(
+                                    split_name=config.eval_split_name,
+                                    results_path=results_path,
+                                    history_step=global_step if config.block_on_periodic_eval else None,
+                                )
+                            )
+                            if config.block_on_periodic_eval:
+                                pending_eval_results = _wait_for_eval_results(
+                                    wandb_run,
+                                    pending_eval_results,
+                                    poll_interval_secs=config.eval_results_poll_interval_secs,
+                                )
+                            last_eval_job_id = submitted_job_id
+
+                _run_main_rank_only_phase(
+                    config=config,
+                    use_ddp=use_ddp,
+                    is_main=is_main,
+                    step=global_step,
+                    phase="checkpoint",
+                    action=_checkpoint_phase,
+                )
 
             # Update progress bar
             if pbar is not None:
@@ -674,24 +1186,66 @@ def train_loop(config: _config.TrainConfig):
     if pbar is not None:
         pbar.close()
 
-    # Finish wandb run
-    if is_main and config.wandb_enabled and wandb_run is not None:
-        job_id = _eval_submission.maybe_submit_final_eval(
-            config,
-            checkpoint_step=global_step,
-            dependency_job_id=last_eval_job_id,
-        )
-        if job_id is not None:
-            eval_prefix = _eval_tracking.metric_namespace_for_split(config.final_eval_split_name)
-            wandb_run.log_summary(
-                {
-                    f"{eval_prefix}/last_submitted_job_id": job_id,
-                    f"{eval_prefix}/last_submitted_checkpoint_step": global_step,
-                }
-            )
-        wandb_run.finish()
+    def _finalize_phase() -> None:
+        nonlocal last_eval_job_id, pending_eval_results
 
-    cleanup_ddp()
+        if config.eval_execution_mode == "local" and config.final_eval_manifest_path is not None:
+            if wandb_run is not None and artifact_manager is not None:
+                _run_local_final_eval(
+                    config,
+                    wandb_run,
+                    artifact_manager,
+                    model=model,
+                    checkpoint_step=global_step,
+                    data_config=data_config,
+                    device=device,
+                )
+        elif config.final_eval_manifest_path is not None and wandb_run is not None:
+            job_id = _eval_submission.maybe_submit_final_eval(
+                config,
+                checkpoint_step=global_step,
+                dependency_job_id=last_eval_job_id,
+            )
+            if job_id is not None:
+                eval_prefix = _eval_tracking.metric_namespace_for_split(config.final_eval_split_name)
+                wandb_run.log_summary(
+                    {
+                        f"{eval_prefix}/last_submitted_job_id": job_id,
+                        f"{eval_prefix}/last_submitted_checkpoint_step": global_step,
+                    }
+                )
+                _, results_path = _eval_submission.build_eval_output_paths(
+                    config,
+                    checkpoint_step=global_step,
+                    split_name=config.final_eval_split_name,
+                )
+                pending_eval_results.append(
+                    PendingEvalResult(
+                        split_name=config.final_eval_split_name,
+                        results_path=results_path,
+                        history_step=global_step,
+                    )
+                )
+            pending_eval_results = _wait_for_eval_results(
+                wandb_run,
+                pending_eval_results,
+                poll_interval_secs=config.eval_results_poll_interval_secs,
+            )
+
+        if wandb_run is not None:
+            wandb_run.finish()
+
+    _run_main_rank_only_phase(
+        config=config,
+        use_ddp=use_ddp,
+        is_main=is_main,
+        step=global_step,
+        phase="finalize",
+        action=_finalize_phase,
+    )
+
+    _ddp_barrier(use_ddp, device)
+    cleanup_ddp(device)
 
 
 def main():

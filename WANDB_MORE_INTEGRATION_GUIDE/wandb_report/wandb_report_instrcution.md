@@ -1,20 +1,11 @@
-# W&B Report Writing Notes
+# OpenPI W&B Integration Outline
 
-This file is a working memo that organizes the OpenPI W&B integration changes in a format that is easy to reuse in a public report or blog post. Every item should always be explained in the order **"Purpose" -> "Changes."**
-
-## Basic Policy
-
-- `openpi/WANDB_MORE_INTEGRATION_GUIDE/wandb_report/wandb_report_en.md` and `openpi/WANDB_MORE_INTEGRATION_GUIDE/wandb_report/wandb_report_jp.md` should be managed as the markdown source of truth.
-- Use `openpi/WANDB_MORE_INTEGRATION_GUIDE/wandb_report/wandb_report.py` to create and update W&B Reports from those markdown files.
-- Assume the report will be published to:
-  - `WANDB_ENTITY=wandb-smle`
-  - `WANDB_PROJECT=openpi-aloha-wandb-integration`
-- The notes below are intended to explain the OpenPI-side code changes in the order **"Purpose -> Changes"** without exception.
+This document organizes the main OpenPI W&B integration changes for the report. Each section starts with the workflow issue we wanted to solve, then summarizes the corresponding changes.
 
 ## Code Change Notes
 
-The items below are ordered in a way that makes them easier to turn into a public-facing report.  
-The goal is not to describe every implementation detail, but to clearly communicate what problem we wanted to solve and what we changed to solve it.
+The sections below are organized around the workflow improvements that matter most in the report.  
+The goal is to keep implementation details concise and make the change in workflow easy to understand.
 
 ### 1. Make training runs easier to compare
 
@@ -49,14 +40,14 @@ The goal is not to describe every implementation detail, but to clearly communic
 
 **Purpose**
 
-- Using additional eval nodes separately from training increases operational cost.
-- If eval jobs sit in the pending queue, results do not come back during training.
+- Evaluation can be run either inside the training allocation or on separate nodes or jobs.
+- In this integration, we chose the inline path so training and evaluation are easier to inspect together and the overall code path stays simpler.
 
 **Changes**
 
 - Added `src/openpi/training/aloha_eval.py` to factor out a reusable evaluation loop for ALOHA Sim.
 - Added an inline local eval flow to `scripts/train.py`, so periodic eval and final eval can run in the same Slurm job and on the same node after checkpoint save.
-- This made it possible to run training and evaluation without splitting them into separate allocations.
+- This keeps training and evaluation easier to inspect together in one place and simplifies the overall control flow. Running evaluation on separate nodes or separate jobs is still a valid approach when that fits the workflow better.
 
 ### 4. Make checkpoint steps and eval results easier to match
 
@@ -68,14 +59,13 @@ The goal is not to describe every implementation detail, but to clearly communic
 **Changes**
 
 - Triggered periodic eval at checkpoint save time and always recorded the corresponding `eval/checkpoint_step`.
-- Enabled `block_on_periodic_eval=True` for `pi0_aloha_sim`, so training does not move to the next step until periodic eval finishes.
+- Enabled `block_on_periodic_eval=True` for `pi0_aloha_sim`, so training does not move to the next step until periodic eval finishes. If evaluation is run on a separate node or as a separate job, this is not required.
 - As a result, each eval result has a clear meaning: it is the result of evaluating a specific checkpoint.
 
 ### 5. Fix the held-out eval split so results are comparable
 
 **Purpose**
 
-- If each run evaluates different episodes, run-to-run comparison becomes unstable.
 - We want periodic eval and final eval to serve different roles.
 
 **Changes**
@@ -104,7 +94,7 @@ The goal is not to describe every implementation detail, but to clearly communic
 **Purpose**
 
 - We want to preserve checkpoints as W&B artifacts.
-- At the same time, full resume state is heavy, and on CoreWeave it creates storage and I/O pressure.
+- At the same time, full resume state is heavy and can create storage and I/O pressure in GPU environments.
 
 **Changes**
 
@@ -146,25 +136,23 @@ The goal is not to describe every implementation detail, but to clearly communic
   - `num_examples`
 - Added an example table so readers can trace episode-level results together with the corresponding videos.
 
-### 10. Make JAX + MuJoCo + W&B stable on CoreWeave
+### 10. Make JAX + MuJoCo + W&B stable in GPU environments
 
 **Purpose**
 
-- Even if things work locally, they often fail on CoreWeave because of GL, OSMesa, cache paths, or home directory quota issues.
-- If the JAX compilation cache or W&B staging directory lands in home, capacity problems show up quickly.
+- We want JAX training and evaluation to run stably in a remote GPU environment.
 
 **Changes**
 
-- Prepared `jobs/train_aloha_sim_jax_8gpu_6h.sbatch` around an `OPENPI_RUNTIME_ROOT=/mnt/data/...` workflow.
-- Redirected `WANDB_DIR`, `WANDB_CACHE_DIR`, `WANDB_ARTIFACT_DIR`, `TMPDIR`, `XDG_CACHE_HOME`, `UV_CACHE_DIR`, and `JAX_COMPILATION_CACHE_DIR` into `/mnt/data`.
-- Added `MUJOCO_GL=osmesa`, `PYOPENGL_PLATFORM=osmesa`, and vendor GL library settings to the job script so headless eval works on GPU nodes.
+- Added job-side runtime and cache configuration so training and evaluation run more reliably in remote environments.
+- Added headless evaluation settings needed for MuJoCo-based evaluation on GPU nodes.
 - Updated `scripts/train.py` so the JAX compilation cache path also respects the environment configuration.
 
 ### 11. Make larger JAX training and follow-up sweeps easier to run
 
 **Purpose**
 
-- We want to run not only smoke tests, but also larger JAX training jobs closer to full-scale runs on CoreWeave.
+- We want to run not only smoke tests, but also larger JAX training jobs closer to full-scale runs in GPU environments.
 - We want to keep launching follow-up experiments while looking at W&B results.
 
 **Changes**
@@ -190,50 +178,16 @@ The goal is not to describe every implementation detail, but to clearly communic
 - Limited video, table, and summary handling to the main rank so same-run logging is less likely to break.
 - Aligned dataset artifact handling with JAX by resolving manifests from existing registry artifacts.
 
-### 13. Add job scripts for running PyTorch on CoreWeave
+### 13. Add job scripts for running PyTorch in GPU environments
 
 **Purpose**
 
 - We want stable smoke runs and full runs on the PyTorch side as well.
-- We want a runtime, cache, and W&B directory layout that is comparable to the JAX side.
+- We want the runtime setup to stay aligned with the JAX side.
 
 **Changes**
 
 - Added `jobs/train_aloha_sim_pytorch_smoke_1gpu.sbatch` for short smoke runs on a single GPU.
 - Added `jobs/train_aloha_sim_pytorch_8gpu_6h.sbatch` for full 1-node / 8-GPU PyTorch training.
-- Explicitly set `OPENPI_RUNTIME_ROOT`, `WANDB_DIR`, `WANDB_CACHE_DIR`, `WANDB_ARTIFACT_DIR`, `TMPDIR`, `XDG_CACHE_HOME`, and `UV_CACHE_DIR` in both job scripts so runtime and cache paths stay organized.
-- Added `MUJOCO_GL=osmesa` and vendor GL settings so headless eval also works on the PyTorch side.
+- Added runtime, cache, and headless evaluation settings needed to run PyTorch jobs more reliably in remote environments.
 - Added `jobs/submit_aloha_pytorch_sweep_4x8gpu_2h.sh` and `jobs/submit_aloha_pytorch_sweep_4x8gpu_8h.sh` so PyTorch sweeps can also be launched in batches.
-
-### 14. Make it possible to create and update W&B Reports from markdown
-
-**Purpose**
-
-- We want the report body to be managed in markdown as the source of truth.
-- After editing the report text, we want to update the W&B report quickly.
-
-**Changes**
-
-- Added `WANDB_MORE_INTEGRATION_GUIDE/wandb_report/wandb_report.py`.
-- Made it read `wandb_report_jp.md` and `wandb_report_en.md`, then split them into H1 / H2 / H3 headings and body blocks for W&B Report generation.
-- Represented body sections as `MarkdownBlock` and kept headings as heading blocks in the report itself.
-- Added `--dry-run` so title and block counts can be checked before upload.
-- Added `--report-url` so an existing report can be overwritten by URL.
-- Set the default destination to `wandb-smle/openpi-aloha-wandb-integration`.
-
-## How To Write The Public Report
-
-- Always write `Purpose` first in each section.
-- Then write `Changes`.
-- Keep implementation details to the minimum needed, and also state how the change improved the user or researcher experience.
-- The following four points are especially important and should be emphasized repeatedly:
-  - Train, periodic eval, and final eval are aggregated into the same W&B run.
-  - Inline eval makes it possible to run evaluation without increasing the number of extra nodes.
-  - Dataset, checkpoint, video, and metrics can all be tracked consistently in W&B.
-  - JAX and PyTorch are aligned so the W&B experience is as similar as possible across both backends.
-
-## What To Prioritize In The Public Report
-
-- In the public-facing report body, focus mainly on items 1 through 13 first.
-- Item 14, the report generation script, can be mentioned separately as an operational note if needed.
-- The main thing readers care about is how the research workflow improved, so report automation should not become the main storyline.

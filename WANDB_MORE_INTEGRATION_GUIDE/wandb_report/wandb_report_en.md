@@ -1,149 +1,247 @@
-# This file is for developing W&B Report for further explanation
+# OpenPI x W&B: A Guide to Connecting Physical AI Workflows
 
-# Title of Report: Openpi with W&B
-# Purpose of this report:
-- Openpi　（https://github.com/Physical-Intelligence/openpi） is getting popular in Physical AI. It has an integration with W&B as it uses pytorch, that has W&B integration.
-- But, it is just for simple experiment tracking. Kei expanded the integaration and created more how tos and tips more to demonstrate how your workflow will be better with W&B.
-- This reports show the overall of the integrations. For technical details, please refer:
-- Isaac simだとシミュレーションの可視化のintegrationはあるが、Openpiのコードにはない。それをdemonstrateしてみた
+## Introduction
 
+[OpenPI](https://github.com/Physical-Intelligence/openpi) is an open-source robotics framework published by [Physical Intelligence](https://www.physicalintelligence.company/), and it has been drawing rapid attention in the Physical AI space. In this report, we use OpenPI as an example to explain how W&B can be used more effectively for Physical AI development. OpenPI supports both JAX and PyTorch, and while it already includes basic W&B integration such as logging loss and learning rate, we also implemented additional integration features such as simulation result visualization.
 
-# Asset
-- W&B Report URL (EN): 
-- W&B Report URL (JP): 
-- github (more integaration with W&B are implemented): 
-- Youtube: Physical AIのWorkflowで使える一般的なW&Bの機能デモについては以下を確認してください。https://www.youtube.com/watch?v=45Beo0ZkJJA
+- [**GitHub repository with the added integrations**](https://github.com/olachinkei/openpi):
+- W&B Project (OpenPI integration example):
 
+Using OpenPI as a concrete example, let us walk through useful ways to use W&B in Physical AI, step by step. For the technical implementation details of the added integration, please refer to the [README in the GitHub repository](https://github.com/olachinkei/openpi).
 
-# Overall
+There is also a white paper explaining the value of W&B in Physical AI, along with a general demo video using IsaacLab as an example, so please take a look at those as well.
 
-題材: PLAN.md やWANDB_INTEGRATION.mdからALOHAのやつをなんかしたことを書いて
-W&B values
-- こんなことを追加した
-- こんなことができる
+- [White Paper: Advancing Physical AI: From learning to embodied intelligence](https://wandb.ai/site/resources/whitepapers/advancing-physical-ai/)
+- [W&B demo video (IsaacLab)](https://www.youtube.com/watch?v=45Beo0ZkJJA)
+- [Example W&B project (IsaacLab)](https://wandb.ai/wandb-smle/isaaclab-wandb-crwv?nw=nwuseranushravvatsa)
 
+In AI development, a single training run produces a large amount of information. Looking only at train loss is not enough. To judge whether a model is actually good, you need to look at the evaluation episode list, checkpoints, success rate, and maximum reward together. Once these pieces are scattered across different scripts, different jobs, and different storage locations, comparison quickly becomes difficult. In Physical AI in particular, simulation visualization matters just as much as metrics.
 
+That is why we developed additional integrations for the OpenPI codebase from the following three perspectives:
+1. Strengthening the experiment comparison foundation
+2. Strengthening the evaluation pipeline with visualization
+3. Managing assets with Artifacts / Registry
+In this report, together with the added integrations, we also walk through useful UI operations that make these workflows easier to use in practice.
 
+---
 
-# 学習: 複数実験の比較
-大量に実験をした際に、容易に比較することができる。
-wandb.initをする際に、いくつかの情報を残すと、後でWorkspaceで便利にみることができる。
+## Example Task: ALOHA Sim Transfer Cube
 
+In this demo, we use the **Transfer Cube** task, where a two-arm ALOHA robot grasps a cube, passes it from one arm to the other, and holds it stably. The training dataset is `lerobot/aloha_sim_transfer_cube_human`, and the configuration is `pi0_aloha_sim`.
+
+This dataset contains 50 episodes in total. In this setup, 10 episodes are held out for final evaluation, while the remaining 40 episodes are used for training. In addition, periodic evaluation uses a fixed subset of 4 episodes from those 10 held-out episodes. Training runs up to 20,000 steps.
+
+The main goal here is to demonstrate how training, evaluation, and asset management can be connected within W&B, so the dataset size is intentionally small. As a result, the outcomes shown here should be understood as workflow examples rather than as a strict benchmark or a statistically robust performance comparison.
+
+---
+
+## 1. Strengthening the Experiment Comparison Foundation
+
+### Saving detailed experiment conditions in config
+
+In W&B, you can save not only time-series data such as loss, but also the conditions of each run in `config`. If you record information such as `config_name`, `task_name`, `dataset_name`, `backend`, `git sha`, and `hostname`, it becomes much easier later to filter specific conditions in the Workspace or compare runs by individual parameters. As shown later, these config values can also be used to color-code runs.
+
+In the original OpenPI W&B integration, the information needed for comparison was not fully captured in `config`. To address this, we added `src/openpi/utils/wandb/run_context.py` and unified W&B run initialization. This makes it possible to store the metadata that is useful for comparison and organization directly in `wandb.config`. The same approach works whether you are using JAX or PyTorch.
+
+For example, run information in W&B can be structured like this:
+
+```python
 import wandb
-config = 
-with wandb.init(
-    project="cat-classification",
-    notes="My first experiment",
-    tags=["baseline", "paper1"],
-    config={"epochs": 100, "learning_rate": 0.001, "batch_size": 128},
-) as run:
-    ...
-    
-今回のスクリプトでは、XXでそれを行っている
-configの詳細こちら https://docs.wandb.ai/models/track/config
 
-- Parallel coordinates chart
-    - 以下のdocからvalueを書いて。使い方は、docmentに渡したら良い。
-    https://docs.wandb.ai/models/app/features/panels/parallel-coordinates
-    - <今回のrunの実際の結果をここに>
-    - W&B Sweepsというものがあることも説明して。自分で手動で大量にrunを回すのと、W&B Sweepsがagent, controlerを使って勝手にやってくることの違いを簡潔に書いて
+wandb.init(
+    project="openpi-integration",
+    config={
+        "config_name": "pi0_aloha_sim",
+        "task_name": "Transfer cube",
+        "dataset_name": "lerobot/aloha_sim_transfer_cube_human",
+        "training_backend": "jax",
+    },
+    tags=["aloha", "transfer-cube"],
+)
+```
 
-- Pinned Runs and Baseline Comparison
-    - You can now set a baseline run and pin up to five runs to keep them on top of the run selector—regardless of filters. 
+### Comparing many experiments in the Workspace
 
-The baseline run is highlighted in line plots for easy comparison, with more analysis features on the way.
-        - demo video; https://www.loom.com/share/b8a5352c01594778ac38ff0ad5fa18d8
-- Semantic Colors by Config Values
-    - You can now color runs based on config (e.g. hyperparameter) values, without requiring aggregation. This is a powerful new way to visually explore and analyze your AI experiments.
+With the config structure above in place, let us look at several useful Workspace features in W&B for comparing many runs.
 
-Here’s what’s new:
+### Useful Feature 1: Parallel Coordinates Chart
 
-Set run colors automatically based on a chosen hyperparameter configuration (e.g., learning rate, batch size, model family).
+The [Parallel Coordinates Chart](https://docs.wandb.ai/models/app/features/panels/parallel-coordinates) is a panel that lets you view relationships between multiple hyperparameters and result metrics at once. For example, if you place `learning_rate`, `batch_size`, `training_backend`, `eval/success_rate`, and `eval_final/primary_score` on the axes, you can visually trace which run configurations led to higher success rates.
 
-Visually spot config-driven effects immediately.
+When you are running many follow-up experiments, it is already useful to simply see where the promising runs cluster together. Even when the final loss alone is hard to interpret, looking at success rate and reward alongside it makes the relationship between settings and outcomes much easier to read.
 
-Now works in other people’s workspaces. You can now use Semantic legends when exploring shared or workspaces.
-Why this matters
+When you run a large search manually, you need to launch jobs one by one with different commands and settings each time. With **W&B Sweeps**, you can define the search space in YAML, and `wandb agent` can automatically choose candidate settings and launch runs. We did not use it in this demo, but it is easy to use and well worth checking out.
 
-This update makes it much easier to spot trends, patterns, and config-driven effects in complex experiments, helping you find insights faster,  even across large, multi-run comparisons.
+### Useful Feature 2: Pinned Runs and Baseline Comparison
 
+Pinned Runs let you keep important baseline runs at the top of the run list. Even as many new experiments are added, your reference runs stay easy to find.
 
-    - demo video: https://www.loom.com/share/640c6d2c04ec4c328c92b530516778bd
-- Saved View
-    - fill here by refering https://docs.wandb.ai/models/track/workspaces
-    - get images from https://mintcdn.com/wb-21fd5541/4kbs1cW6PdjDOqU3/images/app_ui/Menu_Views.jpg?w=2500&fit=max&auto=format&n=4kbs1cW6PdjDOqU3&q=85&s=9b6ce8a5be6b812d6d3520af75e75bbc
+When combined with Baseline Comparison, the baseline run is highlighted directly on line plots, which makes it much easier to judge whether a new run actually improved over the baseline. This is especially useful when comparing fine-tuning runs against a public checkpoint.
 
-# 評価体系の充実
-評価は大事。
-- 評価データセットに対する精度を一気に確認したい。
-- Simulationの結果を確認したい
+Below, the runs are colored by `lr_schedule.peak_lr`.
 
-今回、Scriptに以下を追加した
-- 評価を入れた(PLAN.md やWANDB_INTEGRATION.mdからALOHAのデータを使ってどうやったかを入れて)
-- 評価を
+![Pinned Runs and Baseline Comparison](https://mintcdn.com/wb-21fd5541/57wwTAGN9Q-FX-xN/images/models/pinned-and-baseline-runs/runs-table-with-pinned-and-baseline-runs.png?w=1100&fit=max&auto=format&n=57wwTAGN9Q-FX-xN&q=85&s=288f18afe190c9e11ce65f9e3b3086e1)
 
+Demo video: https://www.loom.com/share/b8a5352c01594778ac38ff0ad5fa18d8
 
-- 評価ベンチマークに対する結果の確認
-    - Runs tableで確認する方法
-        ...
-    - W&B Table機能を使ったleaderboard
-        - W&B Tableを利用することで、それができる。一run 一行でtableを保存して、workspaceで表示すると、複数実験の結果が自動的にaggregateされ、比較テーブルができる
-    - 
+### Useful Feature 3: Semantic Colors by Config Values
 
+Semantic Colors by Config Values automatically assigns colors to runs based on config values. Simply having consistent colors by learning rate, model family, or backend can make a large difference in how readable the charts are.
 
-- 一つ一つの可視化
-    - Isaac Simを使うとSimulationの結果を簡単に可視化することができるが、Openpiのコードではそれがneativeにできないので追加をした。追加の方法については、githubのXXを見て欲しい
-    - 今回の
-        <ここに実際のopenpiの可視化結果を入れる reportでは、pannelを入れると良い>
-    - Media pannelについては、細かくできることが増えており、以下のdocを参考にして欲しい。いくつかの機能を以下で紹介する
-        - https://docs.wandb.ai/models/app/features/panels/media#media-panels
-        - Synchronized Video playback for video evaluations
-            - When evaluating multimodal models, qualitative evaluation is crucial. With synchronized video playback, you can play, pause, scrub, and adjust the speed of multiple videos in sync, allowing visual differences to be immediately apparent.
-            - Why you’ll love it
-Accurate evaluation: Scrub once; every video follows. Great for spotting temporal consistency, motion artifacts, flicker, and style shifts.
+For example, if `training_backend=jax` and `training_backend=pytorch` are automatically shown in different colors, you can quickly see backend-related trends in the same Workspace. Because individual runs remain easy to distinguish before aggregation, it also speeds up judgment during follow-up experiments.
 
-Works for all media panels with videos in your workspace: Configure it once at Workspace, Section, or Panel level, and all videos in media panels across sections or panels in your workspace are synced. 
+![Semantic Colors by Config Values](https://mintcdn.com/wb-21fd5541/_OEDykSS2PIumrEw/images/track/color-code-runs-plot.png?w=1100&fit=max&auto=format&n=_OEDykSS2PIumrEw&q=85&s=93b9f741937503187baa665f41568973)
 
-Auto-play & Auto-loop: Configure videos to auto-play or on loop.
+Demo video: https://www.loom.com/share/640c6d2c04ec4c328c92b530516778bd
 
-Perfect for
-Comparing videos across training runs 
+### Useful Feature 4: Saved Views
 
-Quick visual QA on style, timing, motion, and overall vibe check
+W&B Workspace [Saved Views](https://docs.wandb.ai/models/track/workspaces) let you save panel layouts, filter conditions, color assignments, and display targets exactly as they are.
 
-Reviewing regressions/fixes by aligning moments frame-for-frame
+This is more than just a saved layout. What matters is that you can save a research perspective itself. For example, it is useful to keep separate views such as:
 
-Getting started
-Go to Settings → Media → Sync and toggle Sync video playback.
+- For training checks: a view centered on `train/loss` and `train/grad_norm`
+- For periodic evaluation: a view centered on `eval/success_rate` and `eval/leaderboard`
+- For video review: a view centered on `eval_final/videos`
 
-Tell us what you think and what would make image and video evaluations even better. 
+If a team shares the same Saved View, everyone is literally looking at the same screen when discussing results. Even that alone can make reviews much faster.
 
+![Saved Views Menu](https://mintcdn.com/wb-21fd5541/4kbs1cW6PdjDOqU3/images/app_ui/Menu_No_views.jpg?w=1100&fit=max&auto=format&n=4kbs1cW6PdjDOqU3&q=85&s=7ee0771a9d10880e774d04deff43ed01)
 
-            - demo video; https://www.loom.com/share/244cb3be1de04ad8a4ee22654d730b0f
-        - Synced media sliders
-            - you can now step through media sliders in sync, across multiple panels, letting you easily compare across several related images.  You can sync panels at either the section or the entire workspace level. 
-            - demo video; https://app.getbeamer.com/pictures?id=519192-Ge-_vXnesu-_vTUj77-977-977-977-9Pu-_vVtqbXDWhu-_vX0X77-91r7vv70uRzRd77-9&v=4
+### Automatically choosing and launching the next experiment: W&B Skills
 
-        - Control media pannnels in bulk
-            - Just like line plots, you can now manage all your media panel settings at once—across an entire workspace or a specific section.
+W&B also provides [Skills](https://wandb.ai/site/skills/). This is a framework that makes it easier for coding agents to work with W&B experiment management features. Agents can review training results and run comparisons, consider what conditions to try next, and even proceed to code changes when necessary.
 
-Easily configure media panels to display by epoch or arrange them into customized grid patterns, without having to adjust each panel separately.  (You can always override the global settings for individual panels, though.)  We're aiming to reduce setup time, letting you focus more on analysis and less on configuration.
-            - demo video; https://app.getbeamer.com/pictures?id=504954-Y17vv73vv73vv73vv71_Ie-_vUI1zZg4PO-_ve-_vWHvv73vv70oC--_ve-_ve-_ve-_vXta3ZZz&v=4
+For example, once several training runs have completed, an agent can review the runs and suggest what conditions to try next. When used well, this makes it easier to build a workflow that continuously improves experiments while looking at the latest results.
 
+In our experiments as well, we used W&B Skills as a lightweight aid when deciding later follow-up conditions. W&B Skills is still a fairly new tool, so we would love for you to try it and share lots of feedback.
 
-# アセット管理
-## Artifacts: 学習中の大量のアセット管理
-- Artifactsのvalueをdocから調べて書いて
-- 使い方のイメージは以下を使って
-    https://mintcdn.com/wb-21fd5541/wKCrMJZKG3PxyJhv/images/artifacts/artifacts_landing_page2.png?w=2500&fit=max&auto=format&n=wKCrMJZKG3PxyJhv&q=85&s=3f9dfc871cf363d168542c779d61a6c6
+```bash
+# Local (current project):
+npx skills add wandb/skills --skill '*' --yes
 
-- 今回 implementationした内容を書いて
+# Global (all projects):
+npx skills add wandb/skills --skill '*' --yes --global
 
+# To link skills to a specific agent (for example, Claude Code):
+npx skills add wandb/skills --agent claude-code --skill '*' --yes --global
+```
 
-## Registry: 優れたものを組織で共有し、検索可能にするアセット管理
-- registryのvalueをdocから調べて簡潔に書いて
-- https://mintcdn.com/wb-21fd5541/AXlwJe6YUBax3n2I/images/registry/registry_landing_page.png?w=2500&fit=max&auto=format&n=AXlwJe6YUBax3n2I&q=85&s=88562e36bd19c3d5a7e492a6cabb604c
+---
 
+## 2. Strengthening the Evaluation Pipeline
 
-# 終わりに
-- 便利に使ってねということ
+In Physical AI, checking the simulation itself is extremely important. Quantitative metrics such as success rate or reward do not tell you how the robot actually moved, where it became unstable, or how it failed. That is why visualizing the simulation and checking behavior directly is a necessary part of evaluation.
+
+In other words, both of the following are essential in Physical AI evaluation:
+
+- Quantitative evaluation: indicators such as success rate, maximum reward, and number of steps, which are easy to compare across runs
+- Qualitative evaluation: reviewing rollout videos to understand how the robot moves and how it fails
+
+### Quantitative evaluation: building a leaderboard with W&B Tables
+
+The `scripts/eval_aloha_dataset.py` script we added does more than save evaluation results as JSON or CSV. It also logs them as W&B Tables. W&B Tables let you store structured data in the UI directly.
+
+There are two main ideas here. The first is that we prepared a leaderboard that gives an overview of evaluation results for each run and checkpoint. This makes it easy to compare which checkpoints performed well when multiple runs are displayed side by side in the Workspace.
+
+The second is that we do not stop at the aggregated results. We also preserve sample-level evaluation details. That makes it possible to inspect questions such as "the overall scores are similar, but which samples differ?" or "which episodes failed?" In the W&B Report, you can choose which run to display with the run filter below the panel.
+
+The details of what information goes into the Tables are implemented in `scripts/eval_aloha_dataset.py` and `src/openpi/utils/wandb/leaderboard.py`. The main evaluation values are also written into `run.summary`, so they can be used for filtering and sorting in the Workspace even without opening the Table itself.
+
+<!-- Insert a screenshot of the OpenPI leaderboard table here -->
+
+### Qualitative evaluation: viewing rollout videos in W&B Media Panels
+
+In this integration, ALOHA Sim rollouts are logged as `wandb.Video` and can be viewed step by step in W&B Media Panels. Because rollout videos are kept for each evaluation sample, you can later trace how the robot behaved at each checkpoint.
+
+This makes it possible to visually confirm whether the robot is actually learning to solve the task as training progresses, or whether instability remains along the way. The key point is that improvements and failure modes that are hard to see in scalar metrics alone can now be tracked as simulation videos at each step.
+
+For implementation details, see `scripts/eval_aloha_dataset.py`, `src/openpi/training/aloha_eval.py`, and `src/openpi/utils/wandb/videos.py`.
+
+<!-- Insert a screenshot of OpenPI rollout videos or a W&B Media Panel capture here -->
+
+### Especially useful Media Panel features
+
+As described in the [Media Panels documentation](https://docs.wandb.ai/models/app/features/panels/media#media-panels), W&B Media Panels continued to improve in 2025. As interest in Physical AI grew, the tools for handling simulations and rollout videos also became more capable.
+
+Here, we highlight a few Media Panel features that are especially useful in the Physical AI context.
+
+#### Synchronized Video Playback
+
+This feature lets you play multiple videos in sync. It is useful when comparing successful and failed examples from the same checkpoint, or the same prompt across a JAX run and a PyTorch run. Once you scrub one video, all the others align to the same timestamp, so it becomes easy to compare grasp timing or handoff behavior frame by frame.
+
+Demo video: https://www.loom.com/share/244cb3be1de04ad8a4ee22654d730b0f
+
+#### Synced Media Sliders
+
+This feature synchronizes media sliders across multiple panels. It is useful not only for videos, but also when you want to compare related images or derived media at the same step.
+
+Demo video: https://app.getbeamer.com/pictures?id=519192-Ge-_vXnesu-_vTUj77-977-977-977-9Pu-_vVtqbXDWhu-_vX0X77-91r7vv70uRzRd77-9&v=4
+
+#### Bulk control of Media Panels
+
+This feature lets you manage panel settings together across an entire Workspace or a specific Section. As the number of video panels grows, manual configuration becomes costly. Bulk control helps you align display styles and grid layouts all at once, so you can spend more time analyzing and less time configuring.
+
+Demo video: https://app.getbeamer.com/pictures?id=504954-Y17vv73vv73vv73vv71_Ie-_vUI1zZg4PO-_ve-_vWHvv73vv70oC--_ve-_ve-_ve-_vXta3ZZz&v=4
+
+---
+
+## 3. Asset Management
+
+### Why asset management matters
+
+In Physical AI, it is important to be able to trace, later on, which data was used for training, which checkpoints were evaluated, and what results were obtained. As the number of checkpoints grows, managing everything through local filenames alone quickly becomes difficult.
+
+That is why this integration places strong emphasis on versioning checkpoints and preserving lineage from data to models to evaluation results.
+
+### Artifacts: strengthening checkpoint version management
+
+W&B Artifacts are designed to manage the many checkpoints and result files that appear during experiments as versioned assets. In this integration, we especially strengthened how model checkpoints are handled during training.
+
+For `pi0_aloha_sim`, milestone checkpoints every 5,000 steps and the final checkpoint are published, with aliases such as `step-5000`, `step-10000`, `step-15000`, and `final`. This keeps storage costs under control while still making it easy to compare training progress checkpoint by checkpoint. These settings are also easy to change.
+
+In addition, by using lineage features, we made it easier to trace which datasets and parameters were used to produce each checkpoint, so that model versioning becomes something useful for later comparison and validation rather than simple file storage.
+
+### Registry: preserving dataset and model lineage
+
+W&B Registry is designed to make shared datasets and models easy for a team to reference. In this integration, we first register the training dataset and evaluation datasets in the Registry, and then start training and evaluation by referencing them. While Artifacts are designed to manage the large number of assets generated during experiments, Registry is designed to keep the important assets that a team wants to share easy to find and reuse.
+
+The training dataset and evaluation datasets are registered in the Registry, and training and evaluation are launched by referring to those assets. The artifact refs used here are:
+
+- train: `wandb32/wandb-registry-Physical AI - openpi/training dataset:v0`
+- eval: `wandb32/wandb-registry-Physical AI - openpi/evaluation dataset for openpi:v0`
+- holdout (`eval_final`): `wandb32/wandb-registry-Physical AI - openpi/evaluation dataset for openpi:v1`
+
+In practice, the implementation references the train / eval / holdout (`eval_final`) artifacts using `use_artifact` as shown below. The train artifact is referenced so the dataset version used for training is recorded, while the eval and holdout artifacts are used to resolve manifests and drive actual evaluation.
+
+```python
+dataset_artifact_refs = _dataset_artifacts.configured_dataset_artifact_refs(config)
+if train_ref := dataset_artifact_refs.get("train"):
+    wandb.run.use_artifact(train_ref)
+
+if eval_ref := dataset_artifact_refs.get("eval"):
+    wandb.run.use_artifact(eval_ref)
+    resolved_eval_manifest = _download_artifact_payload(eval_ref, artifact_root / "eval")
+    if resolved_eval_manifest is not None:
+        config = dataclasses.replace(config, eval_manifest_path=str(resolved_eval_manifest))
+
+if holdout_ref := dataset_artifact_refs.get("eval_final"):
+    wandb.run.use_artifact(holdout_ref)
+    resolved_holdout_manifest = _download_artifact_payload(holdout_ref, artifact_root / "eval_final")
+    if resolved_holdout_manifest is not None:
+        config = dataclasses.replace(config, final_eval_manifest_path=str(resolved_holdout_manifest))
+```
+
+Because the same dataset does not need to be uploaded again for every run, operations stay easier to manage, and it also becomes much easier to understand the assumptions behind a model when revisiting it later.
+
+![Registry page](https://mintcdn.com/wb-21fd5541/AXlwJe6YUBax3n2I/images/registry/registry_landing_page.png?w=2500&fit=max&auto=format&n=AXlwJe6YUBax3n2I&q=85&s=88562e36bd19c3d5a7e492a6cabb604c)
+
+---
+
+## Conclusion
+
+With this OpenPI x W&B integration, our goal was to make it possible to follow, from a single run, the configuration that was used, evaluation results at each checkpoint, rollout videos, and the connections between training and evaluation data.
+
+In Physical AI, loss and success rate alone are not enough. By making simulation results easy to visualize, we made it possible to understand performance in a deeper and more practical way.
+
+We hope the integrations introduced here, and the workflow shown in this report, will be useful as a reference when building an experiment foundation for Physical AI.

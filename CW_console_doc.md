@@ -1,4 +1,12 @@
-Welcome to the CoreWeave Training Cluster
+# Specific command to login CW with Keisuke's account 
+
+ssh -o IdentitiesOnly=yes kkamata+cwb607@sunk.cwb607-training.coreweave.app
+
+
+
+
+
+# Welcome to the CoreWeave Training Cluster
 
 The SA team has put together a training Slurm/SUNK (Slurm on Kubernetes) GPU cluster with some exercises on it that you can use to get hands-on with CoreWeave technologies. This is a guide to how to get access and what you can do there. Direct questions/complaints to Tara Madhyastha.
 
