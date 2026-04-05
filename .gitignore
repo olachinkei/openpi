@@ -8,6 +8,7 @@ wandb/
 WANDB_MORE_INTEGRATION_GUIDE/wandb_report/report_integration.md
 WANDB_MORE_INTEGRATION_GUIDE/wandb_report/wandb_report_en.md
 WANDB_MORE_INTEGRATION_GUIDE/wandb_report/wandb_report_jp.md
+WANDB_MORE_INTEGRATION_GUIDE/wandb_report/wandb_report.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
