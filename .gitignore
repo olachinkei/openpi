@@ -2,7 +2,7 @@
 assets/
 checkpoints/
 data/
-wandb/
+/wandb/
 
 # Local report drafts.
 WANDB_MORE_INTEGRATION_GUIDE/wandb_report/report_integration.md

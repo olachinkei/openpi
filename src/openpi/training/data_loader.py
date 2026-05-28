@@ -150,7 +150,7 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    video_backend = os.environ.get("OPENPI_VIDEO_BACKEND") or None
+    video_backend = os.environ.get("OPENPI_VIDEO_BACKEND") or "pyav"
     excluded: set[int] = set()
     available_episodes = sorted(int(episode_index) for episode_index in dataset_meta.episodes)
     if data_config.exclude_episodes:
